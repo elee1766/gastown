@@ -2233,6 +2233,13 @@ func TestMatchesPromptPrefix(t *testing.T) {
 
 		// Bare prompt character without any space
 		{"bare prompt no space", "❯", regularPrefix, true},
+
+		// Regex prefixes (jcode renders the turn number)
+		{"jcode empty prompt", "1>", `re:^\d+>(\s|$)`, true},
+		{"jcode prompt with text", "12> hello", `re:^\d+>(\s|$)`, true},
+		{"jcode sent turn line", " 1› Reply", `re:^\d+>(\s|$)`, false},
+		{"jcode busy prompt", "2…", `re:^\d+>(\s|$)`, false},
+		{"jcode account picker row", " > ● anthropic", `re:^\d+>(\s|$)`, false},
 	}
 
 	for _, tt := range tests {
@@ -2286,6 +2293,10 @@ func TestHasBusyIndicator(t *testing.T) {
 		{"claude status busy", "⏵⏵ bypass permissions on ... · esc to interrupt", true},
 		{"codex status busy", "• Working (2m 18s • esc to interrupt)", true},
 		{"idle line", "› Review ready notification", false},
+		{"jcode spinner busy", "⠴ 9s · 90.6 tps · ↑371 ↓81 · https", true},
+		{"jcode sending busy", "⠋ sending… 3s", true},
+		{"jcode busy prompt", "2…", true},
+		{"jcode turn summary idle", "  29s · 95.5 tps · ↑56 ↓5", false},
 		{"blank", "", false},
 	}
 

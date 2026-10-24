@@ -139,6 +139,30 @@ func TestAnalyzeSubmission(t *testing.T) {
 	}
 }
 
+func TestAnalyzeSubmissionRegexPrompt(t *testing.T) {
+	t.Parallel()
+	const needle = "resume the patrol"
+	const prompt = `re:^\d+>(\s|$)`
+
+	tests := []struct {
+		name    string
+		content string
+		want    submitProbe
+	}{
+		{"jcode stranded", " 1› earlier\n2> resume the patrol\n", probeStranded},
+		{"jcode cleared", " 2› resume the patrol\n3>\n", probeComposerCleared},
+		{"jcode turn started", " 2› resume the patrol\n⠋ sending… 3s\n2…\n", probeTurnStarted},
+		{"jcode dirty", "2> unrelated draft\n", probeComposerDirty},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := analyzeSubmission(tt.content, needle, prompt); got != tt.want {
+				t.Errorf("analyzeSubmission() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestErrSubmitNotVerifiedWrapping(t *testing.T) {
 	t.Parallel()
 	wrapped := fmt.Errorf("nudge to session: %w", fmt.Errorf("submit: %w", ErrSubmitNotVerified))

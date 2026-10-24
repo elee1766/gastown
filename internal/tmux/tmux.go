@@ -1961,6 +1961,7 @@ func (t *Tmux) NudgePane(pane, message string) error {
 // Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(session string) error {
+	t.sendPresetStartupKeys(session)
 	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
 		return fmt.Errorf("workspace trust dialog: %w", err)
 	}
@@ -1968,6 +1969,42 @@ func (t *Tmux) AcceptStartupDialogs(session string) error {
 		return fmt.Errorf("bypass permissions warning: %w", err)
 	}
 	return nil
+}
+
+// sendPresetStartupKeys sends the agent preset's StartupKeys once its startup
+// overlay has rendered. jcode shows an account picker that swallows input
+// until one Escape is pressed; waiting for the ready prompt first makes sure
+// the key reaches the picker rather than arriving before the TUI reads input.
+func (t *Tmux) sendPresetStartupKeys(session string) {
+	agentName, err := t.GetEnvironment(session, "GT_AGENT")
+	if err != nil || agentName == "" {
+		return
+	}
+	preset := config.GetAgentPresetByName(agentName)
+	if preset == nil || len(preset.StartupKeys) == 0 {
+		return
+	}
+	deadline := time.Now().Add(constants.ClaudeStartTimeout)
+	for time.Now().Before(deadline) {
+		if lines, err := t.CapturePaneLines(session, 15); err == nil {
+			found := false
+			for _, line := range lines {
+				if matchesPromptPrefix(line, preset.ReadyPromptPrefix) {
+					found = true
+					break
+				}
+			}
+			if found || preset.ReadyPromptPrefix == "" {
+				break
+			}
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	for _, key := range preset.StartupKeys {
+		_, _ = t.run("send-keys", "-t", session, key)
+		time.Sleep(600 * time.Millisecond)
+	}
 }
 
 // CheckStartupBlocked fails fast when a known interactive startup modal is
@@ -3255,6 +3292,28 @@ func (t *Tmux) WaitForShellReady(session string, timeout time.Duration) error {
 //	- Deacon restarting → Mayor watches via 'gt peek'
 //	- Mayor restarting → Deacon watches via 'gt peek'
 
+// promptRegexPrefix marks a ReadyPromptPrefix as a regular expression, for
+// agents whose prompt varies (jcode renders the turn number: "1>", "2>").
+const promptRegexPrefix = "re:"
+
+var promptRegexCache sync.Map
+
+// promptRegex returns the compiled regex for a "re:" prompt prefix, or nil.
+func promptRegex(readyPromptPrefix string) *regexp.Regexp {
+	if !strings.HasPrefix(readyPromptPrefix, promptRegexPrefix) {
+		return nil
+	}
+	if v, ok := promptRegexCache.Load(readyPromptPrefix); ok {
+		return v.(*regexp.Regexp)
+	}
+	re, err := regexp.Compile(strings.TrimPrefix(readyPromptPrefix, promptRegexPrefix))
+	if err != nil {
+		re = regexp.MustCompile(`$^`)
+	}
+	promptRegexCache.Store(readyPromptPrefix, re)
+	return re
+}
+
 // matchesPromptPrefix reports whether a captured pane line matches the
 // configured ready-prompt prefix. It normalizes non-breaking spaces
 // (U+00A0) to regular spaces before matching, because Claude Code uses
@@ -3263,6 +3322,9 @@ func (t *Tmux) WaitForShellReady(session string, timeout time.Duration) error {
 func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 	if readyPromptPrefix == "" {
 		return false
+	}
+	if re := promptRegex(readyPromptPrefix); re != nil {
+		return re.MatchString(strings.TrimSpace(strings.ReplaceAll(line, "\u00a0", " ")))
 	}
 	trimmed := strings.TrimSpace(line)
 	// Normalize NBSP (U+00A0) → regular space so that prompt matching
@@ -3291,10 +3353,23 @@ func matchesPromptPrefix(line, readyPromptPrefix string) bool {
 // counterpart.
 var busyIndicators = []string{"esc to interrupt"}
 
+// busyLinePatterns match busy status lines that have no fixed marker text.
+// jcode renders a braille spinner with elapsed time while a turn runs
+// ("⠴ 9s · 90.6 tps", "⠋ sending… 3s") and an ellipsis turn prompt ("2…").
+var busyLinePatterns = []*regexp.Regexp{
+	regexp.MustCompile(`^[\x{2800}-\x{28FF}] .*(\d+s|sending)`),
+	regexp.MustCompile(`^\d+…$`),
+}
+
 func hasBusyIndicator(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return false
+	}
+	for _, re := range busyLinePatterns {
+		if re.MatchString(trimmed) {
+			return true
+		}
 	}
 	for _, marker := range busyIndicators {
 		marker = strings.TrimSpace(marker)

@@ -52,6 +52,8 @@ const (
 	// to redirect traffic to api.groq.com. GROQ_API_KEY must be set in the shell
 	// environment — it is read dynamically and never stored in config files.
 	AgentGroqCompound AgentPreset = "groq-compound"
+	// AgentJcode is jcode (github.com/1jehuang/jcode).
+	AgentJcode AgentPreset = "jcode"
 )
 
 // AgentPresetInfo contains the configuration details for an agent preset.
@@ -167,6 +169,11 @@ type AgentPresetInfo struct {
 	// NudgeSessionWithOpts skips the Escape
 	// keystroke and the 600ms readline timeout that follows it.
 	EscapeCancelsRequest bool `json:"escape_cancels_request,omitempty"`
+
+	// StartupKeys are tmux key names sent once after the agent process starts,
+	// before readiness polling, to dismiss startup overlays that capture input
+	// (e.g. jcode's account picker needs one Escape).
+	StartupKeys []string `json:"startup_keys,omitempty"`
 
 	// ACP is the configuration for ACP (Agent Communication Protocol) support.
 	// nil means the agent does not support ACP.
@@ -535,6 +542,29 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		ReadyDelayMs:         10000,
 		InstructionsFile:     "CLAUDE.md",
 		HasTurnBoundaryDrain: true,
+	},
+	// AgentJcode drives the jcode TUI. jcode takes no prompt argument, so
+	// work arrives by nudge. Its prompt is the turn number ("1>", "2>"), so
+	// readiness uses a regex. Escape clears the composer and interrupts a
+	// running turn, so nudges never send it; one Escape at startup dismisses
+	// the account picker, which otherwise swallows the first keystrokes.
+	AgentJcode: {
+		Name:                 AgentJcode,
+		Command:              "jcode",
+		Args:                 []string{"--no-update"},
+		ProcessNames:         []string{"jcode"},
+		SessionIDEnv:         "JCODE_SESSION_ID",
+		ResumeFlag:           "--resume",
+		ResumeStyle:          "flag",
+		SupportsHooks:        false,
+		SupportsForkSession:  false,
+		NonInteractive:       &NonInteractiveConfig{Subcommand: "run", OutputFlag: "--json"},
+		PromptMode:           "none",
+		ReadyPromptPrefix:    `re:^\d+>(\s|$)`,
+		ReadyDelayMs:         4000,
+		InstructionsFile:     "AGENTS.md",
+		EscapeCancelsRequest: true,
+		StartupKeys:          []string{"Escape"},
 	},
 }
 

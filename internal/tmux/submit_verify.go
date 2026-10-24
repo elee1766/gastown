@@ -191,6 +191,20 @@ func trimRunesAndDim(runes []rune, dim []bool) ([]rune, []bool) {
 }
 
 func composerContent(line []rune, dim []bool, promptPrefix string) ([]rune, []bool) {
+	if re := promptRegex(promptPrefix); re != nil {
+		// Regex prompts: content starts where the regex match ends on the
+		// line with leading whitespace removed.
+		lead := 0
+		for lead < len(line) && (line[lead] == ' ' || line[lead] == '\t' || line[lead] == '\u00a0') {
+			lead++
+		}
+		loc := re.FindStringIndex(string(line[lead:]))
+		if loc == nil {
+			return nil, nil
+		}
+		end := lead + utf8.RuneCountInString(string(line[lead:])[:loc[1]])
+		return trimRunesAndDim(line[end:], dim[end:])
+	}
 	prefix := []rune(strings.TrimSpace(strings.ReplaceAll(promptPrefix, "\u00a0", " ")))
 	if len(prefix) == 0 {
 		return nil, nil
