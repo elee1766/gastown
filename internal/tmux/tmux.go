@@ -1839,6 +1839,11 @@ func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) err
 		agentType, _ := t.GetEnvironment(session, "GT_AGENT")
 		if agentType == "copilot" {
 			opts.SkipEscape = true
+		} else if preset := config.GetAgentPresetByName(agentType); preset != nil && preset.EscapeCancelsRequest {
+			// Startup and daemon nudges call NudgeSession directly, so the
+			// preset flag must apply here too, not only in `gt nudge`.
+			// jcode's Escape clears the composer, dropping the message.
+			opts.SkipEscape = true
 		}
 	}
 	// Snapshot before typing the nudge so the message text itself cannot look
