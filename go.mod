@@ -4,6 +4,8 @@ go 1.26.2
 
 toolchain go1.26.10
 
+replace github.com/steveyegge/beads => github.com/elee1766/beads v1.0.6-0.20261024222423-469e910d248f
+
 require (
 	github.com/BurntSushi/toml v1.6.0
 	github.com/charmbracelet/bubbles v1.0.0

@@ -53,6 +53,12 @@ This is not a process-free town. Actual worker dispatch still invokes `gt sling`
 
 `TestNativeConvoyLifecycle` runs with no CLI on PATH and covers assigned work, unassigned dispatch readiness, cross-store completion, durable export and repeat completion. Polecat health scenarios use disposable real SQL stores, including crash mail and protecting active/assigned work. Set `GT_TEST_SDK_HOST` to a disposable server on port 3306 for those tests.
 
+## Beads fork pin
+
+`go.mod` replaces Beads v1.0.5 with `github.com/elee1766/beads` at immutable revision `469e910d248f` (`perf/molecule-close`). This keeps the SDK baseline while pinning our tested fork. Its CLI completion-only descendant traversal avoids calculating dependency/readiness progress after every child close, preserving parent membership and ordinary epic policy.
+
+The optimization lives in `cmd/bd`, not the SDK. Rebuilding `gt` alone does not improve agent-issued `bd close`; install a `bd` binary built from the same pinned revision when rolling out. The fork's `docs/close-performance.md` records real-store regressions and matched isolated measurements: 47–49% less Dolt CPU and 58–61% fewer SQL requests for a 16-child molecule. These are workload-specific results, not a whole-host CPU guarantee.
+
 ## Validation
 
 `internal/beads/sdk_acceptance_test.go` exercises the normal constructors against a disposable real Dolt server with `bd` absent from `PATH`. It covers all 25 adapters, routed databases, agent-bead routing, CC/wisp mail, delivery acknowledgment, default filters, blocked closure and read-only configuration. Without SDK activation it fails at the first create because `bd` is unavailable.
