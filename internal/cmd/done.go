@@ -476,6 +476,9 @@ func doneSourceCloseSkipReasonForHead(bd *beads.Beads, issueID string, issue *be
 	if unchecked := beads.HasUncheckedCriteria(issue); unchecked > 0 {
 		return fmt.Sprintf("issue %s has %d unchecked acceptance criteria — skipping close", issueID, unchecked), false
 	}
+	if attachment := beads.ParseAttachmentFields(issue); attachment != nil && attachment.NoMerge && !attachment.ReviewOnly {
+		return fmt.Sprintf("issue %s has no_merge=true: PR handoff does not prove delivery; skipping close", issueID), false
+	}
 	return "", false
 }
 

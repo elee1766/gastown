@@ -345,6 +345,22 @@ func TestSourceCloseRejectsLocalMergeStrategy(t *testing.T) {
 	}
 }
 
+func TestSourceCloseRejectsNoMergeHandoff(t *testing.T) {
+	issue := &beads.Issue{
+		ID:          "gt-work",
+		Type:        "task",
+		Description: "no_merge: true\n",
+	}
+
+	reason, fatal := doneSourceCloseSkipReason(nil, issue.ID, issue)
+	if reason == "" || fatal {
+		t.Fatalf("no-merge source close gate = %q, %v; want non-fatal skip", reason, fatal)
+	}
+	if !strings.Contains(reason, "no_merge=true") {
+		t.Fatalf("reason = %q, want no-merge handoff reason", reason)
+	}
+}
+
 func TestDirectMergeRejectsUnsafeSourceBeforePush(t *testing.T) {
 	freshEvidenceReviewOnly := &beads.Issue{
 		ID:          "gt-review",
