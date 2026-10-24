@@ -29,6 +29,13 @@ func (t *Tmux) acpClient(session string) (*acpworker.Client, bool, error) {
 	}
 	return acpworker.NewClient(socket), true, nil
 }
+
+// IsACP reports whether the session runs an ACP worker.
+func (t *Tmux) IsACP(session string) bool {
+	_, acp, _ := t.acpClient(session)
+	return acp
+}
+
 func (t *Tmux) acpAlive(session string) (bool, bool, error) {
 	client, acp, err := t.acpClient(session)
 	if !acp || err != nil {

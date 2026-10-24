@@ -905,6 +905,11 @@ func (m *SessionManager) verifyStartupNudgeDelivery(sessionID string, rc *config
 	if rc == nil || rc.Tmux == nil || rc.Tmux.ReadyPromptPrefix == "" {
 		return
 	}
+	// ACP prompts are acknowledged through the control socket, so there is no
+	// lost-nudge race to detect and the pane does not show Claude's idle markers.
+	if m.tmux.IsACP(sessionID) {
+		return
+	}
 
 	// Use configurable thresholds from operational config so operators can tune
 	// via settings/config.json without rebuilding. Both fall back to compiled-in

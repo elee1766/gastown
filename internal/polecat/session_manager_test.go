@@ -616,6 +616,33 @@ func TestVerifyStartupNudgeDelivery_NilConfig(t *testing.T) {
 	m.verifyStartupNudgeDelivery("nonexistent-session", rc, "")
 }
 
+func TestVerifyStartupNudgeDelivery_ACPSkipsDelay(t *testing.T) {
+	requireTmux(t)
+
+	tm := tmux.NewTmux()
+	sessionName := fmt.Sprintf("gt-test-nudge-acp-%d", testSessionCounter.Add(1))
+	_ = tm.KillSession(sessionName)
+	if err := tm.NewSession(sessionName, os.TempDir()); err != nil {
+		t.Fatalf("NewSession: %v", err)
+	}
+	t.Cleanup(func() { _ = tm.KillSession(sessionName) })
+	if err := tm.SetEnvironment(sessionName, "GT_RUNTIME_TRANSPORT", "acp"); err != nil {
+		t.Fatalf("SetEnvironment: %v", err)
+	}
+	if err := tm.SetEnvironment(sessionName, "GT_ACP_SOCKET", filepath.Join(t.TempDir(), "acp.sock")); err != nil {
+		t.Fatalf("SetEnvironment: %v", err)
+	}
+
+	m := NewSessionManager(tm, &rig.Rig{Name: "test-rig", Path: t.TempDir()})
+	rc := &config.RuntimeConfig{Tmux: &config.RuntimeTmuxConfig{ReadyPromptPrefix: "❯ "}}
+
+	start := time.Now()
+	m.verifyStartupNudgeDelivery(sessionName, rc, "check your hook")
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("ACP session waited %s for startup nudge verification", elapsed)
+	}
+}
+
 func TestPromptlessFallbackIncludesPrimeAndWorkInstructions(t *testing.T) {
 	beaconConfig := session.BeaconConfig{
 		Recipient:               session.BeaconRecipient("polecat", "toast", "demo"),
