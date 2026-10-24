@@ -1867,6 +1867,7 @@ func fillRuntimeDefaults(rc *RuntimeConfig) *RuntimeConfig {
 	// Create result with scalar fields (strings are immutable in Go)
 	result := &RuntimeConfig{
 		Provider:      rc.Provider,
+		Transport:     rc.Transport,
 		Command:       rc.Command,
 		InitialPrompt: rc.InitialPrompt,
 		PromptMode:    rc.PromptMode,
@@ -2287,6 +2288,7 @@ func BuildStartupCommand(envVars map[string]string, rigPath, prompt string) stri
 		resolvedEnv[k] = v
 	}
 
+	RuntimeTransportEnv(resolvedEnv, rc)
 	SanitizeAgentEnv(resolvedEnv, envVars)
 
 	var cmd string
@@ -2544,6 +2546,7 @@ func BuildStartupCommandWithAgentOverride(envVars map[string]string, rigPath, pr
 		resolvedEnv[k] = v
 	}
 
+	RuntimeTransportEnv(resolvedEnv, rc)
 	SanitizeAgentEnv(resolvedEnv, envVars)
 
 	var cmd string

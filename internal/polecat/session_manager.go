@@ -475,6 +475,7 @@ func (m *SessionManager) Start(polecat string, opts SessionStartOptions) error {
 		envVars[runtimeConfig.Session.ConfigDirEnv] = opts.RuntimeConfigDir
 	}
 
+	config.RuntimeTransportEnv(envVars, runtimeConfig)
 	// Create session with command and env vars via -e flags so the initial
 	// shell — and Claude's subprocesses (notably bd) — inherit them from the start.
 	// See: https://github.com/anthropics/gastown/issues/280 (race condition fix)

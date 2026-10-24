@@ -70,6 +70,9 @@ type AgentPresetInfo struct {
 	// Args are the default command-line arguments for autonomous mode.
 	Args []string `json:"args"`
 
+	// Transport selects terminal control (default) or structured ACP control.
+	Transport string `json:"transport,omitempty"`
+
 	// Env are environment variables to set when starting the agent.
 	// These are merged with the standard GT_* variables.
 	// Used for agent-specific configuration like OPENCODE_PERMISSION.
@@ -565,6 +568,7 @@ var builtinPresets = map[AgentPreset]*AgentPresetInfo{
 		InstructionsFile:     "AGENTS.md",
 		EscapeCancelsRequest: true,
 		StartupKeys:          []string{"Escape"},
+		ACP:                  &ACPConfig{Command: "acp"},
 	},
 }
 
@@ -770,10 +774,12 @@ func runtimeConfigFromAgentInfo(preset AgentPreset, info *AgentPresetInfo) *Runt
 	}
 
 	rc := &RuntimeConfig{
-		Provider: string(info.Name),
-		Command:  info.Command,
-		Args:     append([]string(nil), info.Args...),
-		Env:      envCopy,
+		Provider:  string(info.Name),
+		Transport: info.Transport,
+		ACP:       info.ACP,
+		Command:   info.Command,
+		Args:      append([]string(nil), info.Args...),
+		Env:       envCopy,
 	}
 
 	if preset == AgentClaude && rc.Command == "claude" {

@@ -1288,6 +1288,9 @@ func (t *Tmux) SendKeys(session, keys string) error {
 // This prevents race conditions where Enter arrives before paste is processed.
 func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr error) {
 	defer func() { telemetry.RecordPromptSend(context.Background(), session, keys, debounceMs, retErr) }()
+	if acp, err := t.nudgeACP(session, keys); acp || err != nil {
+		return err
+	}
 	// Send text using literal mode (-l) to handle special chars
 	if _, err := t.run("send-keys", "-t", session, "-l", keys); err != nil {
 		return err
@@ -1303,6 +1306,17 @@ func (t *Tmux) SendKeysDebounced(session, keys string, debounceMs int) (retErr e
 
 // SendKeysRaw sends keystrokes without adding Enter.
 func (t *Tmux) SendKeysRaw(session, keys string) error {
+	if client, acp, err := t.acpClient(session); acp || err != nil {
+		if err != nil {
+			return err
+		}
+		if keys != "C-c" {
+			return fmt.Errorf("raw keys are not supported for ACP session %s", session)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return client.Cancel(ctx)
+	}
 	_, err := t.run("send-keys", "-t", session, keys)
 	return err
 }
@@ -1312,6 +1326,9 @@ func (t *Tmux) SendKeysRaw(session, keys string) error {
 // Uses Ctrl-U to clear the input line before sending the new message.
 // The delay parameter controls how long to wait after clearing before sending (ms).
 func (t *Tmux) SendKeysReplace(session, keys string, clearDelayMs int) error {
+	if acp, err := t.nudgeACP(session, keys); acp || err != nil {
+		return err
+	}
 	// Send Ctrl-U to clear any pending input on the line
 	if _, err := t.run("send-keys", "-t", session, "C-u"); err != nil {
 		return err
@@ -1787,6 +1804,9 @@ func isTmuxIndex(value string) bool {
 // NudgeSessionWithOpts is like NudgeSession but accepts delivery options.
 // See NudgeOpts for available options.
 func (t *Tmux) NudgeSessionWithOpts(session, message string, opts NudgeOpts) error {
+	if acp, err := t.nudgeACP(session, message); acp || err != nil {
+		return err
+	}
 	// Cross-process lock: serialize nudges across OS processes via flock(2).
 	// Each `gt nudge` CLI invocation is a separate process, so the in-process
 	// channel semaphore below provides no cross-process protection. Without
@@ -1978,6 +1998,9 @@ func (t *Tmux) NudgePane(pane, message string) error {
 // Call this after starting the agent and waiting for it to initialize (WaitForCommand),
 // but before sending any prompts. Idempotent: safe to call on sessions without dialogs.
 func (t *Tmux) AcceptStartupDialogs(session string) error {
+	if _, acp, err := t.acpClient(session); acp || err != nil {
+		return err
+	}
 	t.sendPresetStartupKeys(session)
 	if err := t.AcceptWorkspaceTrustDialog(session); err != nil {
 		return fmt.Errorf("workspace trust dialog: %w", err)
@@ -2028,6 +2051,9 @@ func (t *Tmux) sendPresetStartupKeys(session string) {
 // still visible after dialog acceptance. These modals block automated sessions
 // from receiving or acting on the bootstrap prompt.
 func (t *Tmux) CheckStartupBlocked(session string) error {
+	if _, acp, err := t.acpClient(session); acp || err != nil {
+		return err
+	}
 	deadline := time.Now().Add(constants.DialogPollTimeout)
 	var blocker string
 	for {
@@ -2894,6 +2920,9 @@ Run: gt mail inbox
 // If expectedPaneCommands is non-empty, the pane's current command must match one of them.
 // If expectedPaneCommands is empty, any non-shell command counts as "agent running".
 func (t *Tmux) IsAgentRunning(session string, expectedPaneCommands ...string) bool {
+	if alive, acp, err := t.acpAlive(session); acp || err != nil {
+		return alive && err == nil
+	}
 	cmd, err := t.GetPaneCommand(session)
 	if err != nil {
 		return false
@@ -2931,6 +2960,9 @@ func (t *Tmux) IsRuntimeRunning(session string, processNames []string) bool {
 // query errors so destructive cleanup callers can fail closed instead of
 // treating unknown liveness as confirmed absence.
 func (t *Tmux) IsRuntimeRunningChecked(session string, processNames []string) (bool, error) {
+	if alive, acp, err := t.acpAlive(session); acp || err != nil {
+		return alive, err
+	}
 	if len(processNames) == 0 {
 		return false, nil
 	}
@@ -3193,6 +3225,9 @@ func (t *Tmux) IsAgentAlive(session string) bool {
 // IsAgentAliveChecked is like IsAgentAlive, but preserves liveness-query errors
 // for callers that must not treat unknown state as confirmed death.
 func (t *Tmux) IsAgentAliveChecked(session string) (bool, error) {
+	if alive, acp, err := t.acpAlive(session); acp || err != nil {
+		return alive, err
+	}
 	processNames, err := t.resolveSessionProcessNamesChecked(session)
 	if err != nil {
 		return false, err
@@ -3233,6 +3268,9 @@ func (t *Tmux) resolveSessionProcessNamesChecked(session string) ([]string, erro
 // claude-original) where exec env does not replace the shell as the pane
 // foreground process. Replaces process-tree probing (IsAgentAlive) per gt-sk5u.
 func (t *Tmux) WaitForCommand(session string, excludeCommands []string, timeout time.Duration) error {
+	if acp, err := t.waitACP(session, timeout, false); acp || err != nil {
+		return err
+	}
 	// ZFC: Clear agent-ready sentinel to prevent stale values from previous
 	// agent runs. The agent's SessionStart hook (gt prime --hook) sets this
 	// to "1" once the agent is running. Unsetting here ensures we only detect
@@ -3453,6 +3491,9 @@ func readyPromptPrefixForSession(t *Tmux, session string) string {
 }
 
 func (t *Tmux) WaitForRuntimeReady(session string, rc *config.RuntimeConfig, timeout time.Duration) error {
+	if acp, err := t.waitACP(session, timeout, false); acp || err != nil {
+		return err
+	}
 	if rc == nil || rc.Tmux == nil {
 		return nil
 	}
@@ -3500,6 +3541,9 @@ const DefaultReadyPromptPrefix = "❯ "
 // Returns nil if the agent becomes idle within the timeout.
 // Returns an error if the timeout expires while the agent is still busy.
 func (t *Tmux) WaitForIdle(session string, timeout time.Duration) error {
+	if acp, err := t.waitACP(session, timeout, true); acp || err != nil {
+		return err
+	}
 	promptPrefix := readyPromptPrefixForSession(t, session)
 	prefix := strings.TrimSpace(promptPrefix)
 

@@ -767,6 +767,8 @@ type RuntimeConfig struct {
 	// Instructions controls the per-workspace instruction file name.
 	Instructions *RuntimeInstructionsConfig `json:"instructions,omitempty"`
 
+	Transport string `json:"transport,omitempty"`
+
 	// ACP configures ACP (Agent Communication Protocol) support.
 	// When set, the agent can run in ACP mode. If nil, ACP support is
 	// determined by matching the Command to a known preset with ACP config.
@@ -844,6 +846,9 @@ func DefaultRuntimeConfig() *RuntimeConfig {
 // glob expansion.
 func (rc *RuntimeConfig) BuildCommand() string {
 	resolved := normalizeRuntimeConfig(rc)
+	if resolved.Transport == "acp" {
+		return shellCommand(resolved.acpArgs(""))
+	}
 
 	cmd := resolved.Command
 	args := resolved.Args
@@ -865,6 +870,9 @@ func (rc *RuntimeConfig) BuildCommand() string {
 // For opencode, uses --prompt flag; for other agents, uses positional argument.
 func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 	resolved := normalizeRuntimeConfig(rc)
+	if resolved.Transport == "acp" {
+		return shellCommand(resolved.acpArgs(prompt))
+	}
 	base := resolved.BuildCommand()
 
 	// Use provided prompt or fall back to config
@@ -911,6 +919,9 @@ func (rc *RuntimeConfig) BuildCommandWithPrompt(prompt string) string {
 // BuildArgsWithPrompt returns the runtime command and args suitable for exec.
 func (rc *RuntimeConfig) BuildArgsWithPrompt(prompt string) []string {
 	resolved := normalizeRuntimeConfig(rc)
+	if resolved.Transport == "acp" {
+		return resolved.acpArgs(prompt)
+	}
 	args := append([]string{resolved.Command}, resolved.Args...)
 
 	p := prompt

@@ -548,7 +548,9 @@ func startDeaconSession(t *tmux.Tmux, sessionName, agentOverride string) error {
 		TownRoot:         townRoot,
 		RuntimeConfigDir: runtimeConfigDir,
 		Agent:            agentOverride,
+		SessionName:      sessionName,
 	})
+	config.RuntimeTransportEnv(envVars, runtimeConfig)
 
 	// Create session with command and env vars via -e flags so the initial
 	// shell (and subprocesses Claude spawns) inherit them from the start.

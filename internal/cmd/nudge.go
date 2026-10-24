@@ -172,6 +172,11 @@ func deliverNudge(t *tmux.Tmux, sessionName, message, sender string) error {
 
 	townRoot, _ := workspace.FindFromCwd()
 
+	// ACP accepts a durable queue entry in every delivery mode without interrupting a turn.
+	if transport, err := t.GetEnvironment(sessionName, "GT_RUNTIME_TRANSPORT"); err == nil && transport == "acp" {
+		return t.NudgeSessionWithOpts(sessionName, fmt.Sprintf("[from %s] %s", sender, message), tmux.NudgeOpts{TownRoot: townRoot})
+	}
+
 	// Use the requested mode, but force queue mode for ACP sessions.
 	// ACP agents don't have tmux panes to send-keys to.
 	mode := nudgeModeFlag

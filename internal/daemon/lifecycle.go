@@ -320,6 +320,10 @@ func (d *Daemon) identityToSession(identity string) string {
 		return ""
 	}
 
+	return sessionNameForIdentity(parsed)
+}
+
+func sessionNameForIdentity(parsed *ParsedIdentity) string {
 	switch parsed.RoleType {
 	case constants.RoleMayor:
 		return session.MayorSessionName()
@@ -406,7 +410,9 @@ func (d *Daemon) restartSession(sessionName, identity string) error {
 		AgentName:    parsed.AgentName,
 		TownRoot:     d.config.TownRoot,
 		SessionIDEnv: sessionIDEnv,
+		SessionName:  sessionName,
 	})
+	config.RuntimeTransportEnv(envVars, rc)
 	config.SanitizeAgentEnv(envVars, map[string]string{})
 
 	// Create session with command as initial process (replaces EnsureSessionFresh + SendKeys).
@@ -564,7 +570,9 @@ func (d *Daemon) getStartCommand(roleConfig *beads.RoleConfig, parsed *ParsedIde
 		AgentName:    parsed.AgentName,
 		TownRoot:     d.config.TownRoot,
 		SessionIDEnv: sessionIDEnv,
+		SessionName:  sessionNameForIdentity(parsed),
 	})
+	config.RuntimeTransportEnv(envVars, runtimeConfig)
 	config.SanitizeAgentEnv(envVars, map[string]string{})
 	return config.PrependEnv("exec "+runtimeConfig.BuildCommandWithPrompt(prompt), envVars)
 }
@@ -589,6 +597,11 @@ func (d *Daemon) setSessionEnvironment(sessionName string, roleConfig *beads.Rol
 		RuntimeConfigDir: runtimeConfigDir,
 		SessionName:      sessionName,
 	})
+	rigPath := ""
+	if parsed.RigName != "" {
+		rigPath = filepath.Join(d.config.TownRoot, parsed.RigName)
+	}
+	config.RuntimeTransportEnv(envVars, config.ResolveRoleAgentConfig(parsed.RoleType, d.config.TownRoot, rigPath))
 	for k, v := range envVars {
 		_ = d.tmux.SetEnvironment(sessionName, k, v)
 	}

@@ -743,6 +743,10 @@ func (m *Manager) Start(name string, opts StartOptions) error {
 	// any existing session, so a validation failure cannot leave the user
 	// without a running session.
 	var claudeCmd string
+	if opts.ResumeSessionID != "" && runtimeConfig.Transport == "acp" {
+		return fmt.Errorf("ACP workers restore their saved session automatically; start or restart without --resume")
+	}
+
 	if opts.ResumeSessionID != "" {
 		// Validate session ID to prevent shell injection. The ID is interpolated
 		// into a shell command string, so reject anything with metacharacters.

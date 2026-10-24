@@ -266,7 +266,7 @@ func GetStartupFallbackInfo(rc *config.RuntimeConfig) *StartupFallbackInfo {
 	}
 
 	hasHooks := rc.Hooks != nil && rc.Hooks.Provider != "" && rc.Hooks.Provider != "none" && !rc.Hooks.Informational
-	hasPrompt := rc.PromptMode != "none"
+	hasPrompt := rc.Transport == "acp" || rc.PromptMode != "none"
 
 	info := &StartupFallbackInfo{}
 

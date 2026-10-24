@@ -411,6 +411,7 @@ func MergeRuntimeLivenessEnv(envVars map[string]string, runtimeConfig *config.Ru
 	if runtimeConfig == nil {
 		return envVars
 	}
+	config.RuntimeTransportEnv(envVars, runtimeConfig)
 
 	if _, hasGTAgent := envVars["GT_AGENT"]; !hasGTAgent && runtimeConfig.ResolvedAgent != "" {
 		envVars["GT_AGENT"] = runtimeConfig.ResolvedAgent

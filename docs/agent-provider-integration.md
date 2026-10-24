@@ -27,6 +27,8 @@ is configuration, not compilation.
 
 ## Integration Tiers
 
+For headless structured control without an agent TUI, see [ACP workers](acp-workers.md).
+
 | Tier | Effort | What You Get | What You Provide |
 |------|--------|--------------|------------------|
 | **0: Zero** | Nothing | Basic tmux orchestration | A CLI that runs in a terminal |
