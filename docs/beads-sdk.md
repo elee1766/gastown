@@ -33,6 +33,14 @@ Local SDK closes reject templates, pinned issues without force, and open blocker
 
 Create defaults, query limits, active-status filtering, and durable/wisp selection match the corresponding adapters' CLI behavior.
 
+## Rig identity and polling recovery
+
+The daemon requires a durable `<prefix>-rig-<name>` identity record to verify that a rig is not parked or docked. Missing records fail closed and are reported separately from database errors. Failed lookups back off from 30 seconds to five minutes, with one warning per attempt. Successful status checks are not cached, so persisted park/dock changes remain visible on the next check. Local parked/docked overrides are checked before the retry cache.
+
+`gt rig add`, including adoption, returns an error when identity creation fails. Registration may already have completed, so repair the registered rig rather than deleting or recreating its worktrees. Before repairing an existing identity, inspect local `.beads-wisp/config/<rig>.json` and preserve parked/docked intent and disabled merge queues. The rig type must be durable, not listed in `types.infra`.
+
+The convoy event poller waits for the headquarters store before retaining per-rig stores. This avoids a partial startup that permanently skips convoy lookups after headquarters briefly fails to connect.
+
 ## Validation
 
 `internal/beads/sdk_acceptance_test.go` exercises the normal constructors against a disposable real Dolt server with `bd` absent from `PATH`. It covers all 25 adapters, routed databases, agent-bead routing, CC/wisp mail, delivery acknowledgment, default filters, blocked closure and read-only configuration. Without SDK activation it fails at the first create because `bd` is unavailable.

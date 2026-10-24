@@ -133,6 +133,17 @@ type Daemon struct {
 	// legacySocketCleanupOnce ensures upgrade cleanup only runs once per daemon
 	// lifetime, before any patrol agent can be started on the current socket.
 	legacySocketCleanupOnce sync.Once
+
+	// Failed identity lookups are retried with backoff, never treated as active.
+	rigLookupMu       sync.Mutex
+	rigLookupFailures map[string]*rigLookupFailure
+}
+
+type rigLookupFailure struct {
+	mu      sync.Mutex
+	retryAt time.Time
+	delay   time.Duration
+	reason  string
 }
 
 // sessionDeath records a detected session death for mass death analysis.
@@ -2079,6 +2090,9 @@ func (d *Daemon) openBeadsStores() (map[string]beadsdk.Storage, error) {
 		stores["hq"] = store
 	} else {
 		d.logger.Printf("Convoy: hq beads store unavailable: %s", util.FirstLine(err.Error()))
+		// Every event needs the hq store for convoy resolution. Retry the whole
+		// acquisition rather than retaining a partial set that never retries hq.
+		return nil, nil
 	}
 
 	// Per-rig stores
@@ -2193,10 +2207,7 @@ func (d *Daemon) getPatrolRigs(patrol string) []string {
 func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 	cfg := wisp.NewConfig(d.config.TownRoot, rigName)
 
-	// Warn if wisp config is missing - parked/docked state may have been lost
-	if _, err := os.Stat(cfg.ConfigPath()); os.IsNotExist(err) {
-		d.logger.Printf("Warning: no wisp config for %s - parked state may have been lost", rigName)
-	}
+	// Missing local config means no override, not lost persistent rig state.
 
 	// Check wisp layer first (local/ephemeral overrides)
 	status := cfg.GetString("status")
@@ -2222,8 +2233,27 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 
 	rigBeadID := fmt.Sprintf("%s-rig-%s", prefix, rigName)
 	rigBeadsDir := beads.ResolveBeadsDir(rigPath)
+	key := rigBeadsDir + ":" + rigBeadID
+	d.rigLookupMu.Lock()
+	if d.rigLookupFailures == nil {
+		d.rigLookupFailures = make(map[string]*rigLookupFailure)
+	}
+	failure := d.rigLookupFailures[key]
+	if failure == nil {
+		failure = &rigLookupFailure{}
+		d.rigLookupFailures[key] = failure
+	}
+	d.rigLookupMu.Unlock()
+	failure.mu.Lock()
+	defer failure.mu.Unlock()
+	if time.Now().Before(failure.retryAt) {
+		return false, failure.reason
+	}
 	bd := beads.NewWithBeadsDir(rigPath, rigBeadsDir)
 	if issue, err := bd.Show(rigBeadID); err == nil {
+		failure.retryAt = time.Time{}
+		failure.delay = 0
+		failure.reason = ""
 		for _, label := range issue.Labels {
 			if label == "status:docked" {
 				return false, "rig is docked (global)"
@@ -2237,8 +2267,20 @@ func (d *Daemon) isRigOperational(rigName string) (bool, string) {
 		// FAIL-SAFE: When we can't verify docked status (Dolt down, network issue, etc.),
 		// assume the rig is NOT operational. This prevents wasting API credits starting
 		// witnesses that might be docked. Better to delay work than burn credits unnecessarily.
-		d.logger.Printf("Warning: failed to check rig bead %s for docked/parked status: %v (assuming not operational)", rigBeadID, err)
-		return false, "cannot verify rig status (Dolt unavailable)"
+		failure.delay *= 2
+		if failure.delay < 30*time.Second {
+			failure.delay = 30 * time.Second
+		}
+		if failure.delay > 5*time.Minute {
+			failure.delay = 5 * time.Minute
+		}
+		failure.reason = "cannot verify rig status (Dolt unavailable)"
+		if errors.Is(err, beads.ErrNotFound) {
+			failure.reason = "rig identity missing: " + rigBeadID
+		}
+		failure.retryAt = time.Now().Add(failure.delay)
+		d.logger.Printf("Warning: failed to check rig bead %s: %v (assuming not operational; retry in %s)", rigBeadID, err, failure.delay)
+		return false, failure.reason
 	}
 
 	// Check auto_restart config

@@ -609,8 +609,7 @@ func runRigAdd(cmd *cobra.Command, args []string) error {
 			State:  beads.RigStateActive,
 		}
 		if _, err := bd.CreateRigBead(name, fields); err != nil {
-			// Non-fatal: rig is functional without the identity bead
-			fmt.Printf("  %s Could not create rig identity bead: %v\n", style.Warning.Render("!"), err)
+			return fmt.Errorf("rig %s is registered, but required identity bead creation failed: %w; repair the identity before starting patrols", name, err)
 		} else {
 			rigBeadID := beads.RigBeadIDWithPrefix(newRig.Config.Prefix, name)
 			fmt.Printf("  Created rig identity bead: %s\n", rigBeadID)
@@ -1330,7 +1329,7 @@ func runRigAdopt(_ *cobra.Command, args []string) error {
 				State:  beads.RigStateActive,
 			}
 			if _, err := bd.CreateRigBead(name, fields); err != nil {
-				fmt.Printf("  %s Could not create rig identity bead: %v\n", style.Warning.Render("!"), err)
+				return fmt.Errorf("rig %s is adopted, but required identity bead creation failed: %w; repair the identity before starting patrols", name, err)
 			} else {
 				fmt.Printf("  %s Created rig identity bead: %s\n", style.Success.Render("✓"), rigBeadID)
 			}

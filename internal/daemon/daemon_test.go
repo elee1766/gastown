@@ -922,11 +922,12 @@ func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
 	}
 
 	// Create daemon with no Dolt server running
+	var warnings bytes.Buffer
 	d := &Daemon{
 		config: &Config{
 			TownRoot: tmpDir,
 		},
-		logger: log.New(io.Discard, "", 0), // Suppress log output
+		logger: log.New(&warnings, "", 0),
 	}
 
 	// When Dolt is unavailable, isRigOperational should return false
@@ -940,6 +941,18 @@ func TestIsRigOperational_FailSafeOnDoltUnavailable(t *testing.T) {
 	}
 	if !strings.Contains(reason, "Dolt unavailable") && !strings.Contains(reason, "cannot verify") {
 		t.Errorf("reason should mention Dolt unavailable, got: %q", reason)
+	}
+	firstWarning := warnings.String()
+	if firstWarning == "" {
+		t.Fatal("first failed lookup must warn the operator")
+	}
+	for range 3 {
+		if ok, retryReason := d.isRigOperational(rigName); ok || retryReason != reason {
+			t.Fatalf("retry should remain fail-closed: %v, %q", ok, retryReason)
+		}
+	}
+	if warnings.String() != firstWarning {
+		t.Fatal("repeated checks within the retry window emitted duplicate warnings")
 	}
 }
 
