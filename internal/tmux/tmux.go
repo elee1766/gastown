@@ -128,6 +128,16 @@ func SetDefaultSocket(name string) {
 	defaultSocketMu.Unlock()
 }
 
+// tmuxConfArgs returns ["-f", path] when GT_TMUX_CONF is set, so the town's
+// tmux server loads its own config instead of ~/.tmux.conf. tmux only reads
+// -f when it starts the server, so passing it on every call is harmless.
+func tmuxConfArgs() []string {
+	if conf := os.Getenv("GT_TMUX_CONF"); conf != "" {
+		return []string{"-f", conf}
+	}
+	return nil
+}
+
 // GetDefaultSocket returns the current default tmux socket name.
 func GetDefaultSocket() string {
 	defaultSocketMu.RLock()
@@ -173,6 +183,7 @@ func BuildCommandContext(ctx context.Context, args ...string) *exec.Cmd {
 	if sock := GetDefaultSocket(); sock != "" {
 		allArgs = append(allArgs, "-L", sock)
 	}
+	allArgs = append(allArgs, tmuxConfArgs()...)
 	allArgs = append(allArgs, args...)
 	cmd := exec.CommandContext(ctx, "tmux", allArgs...)
 	hideConsoleWindow(cmd)
@@ -229,6 +240,7 @@ func (t *Tmux) commandContext(ctx context.Context, args ...string) *exec.Cmd {
 	if t.socketName != "" {
 		allArgs = append(allArgs, "-L", t.socketName)
 	}
+	allArgs = append(allArgs, tmuxConfArgs()...)
 	allArgs = append(allArgs, args...)
 	cmd := exec.CommandContext(ctx, "tmux", allArgs...)
 	hideConsoleWindow(cmd)

@@ -25,7 +25,7 @@ func TestMain(m *testing.M) {
 	// The sentinel uses a name no individual test touches, so it outlives all
 	// per-test sessions. TestMain kills the whole server at the end.
 	if _, err := exec.LookPath("tmux"); err == nil {
-		_ = exec.Command("tmux", "-u", "-L", socket, "new-session", "-d", "-s", "gt-test-sentinel").Run()
+		_ = BuildCommand("new-session", "-d", "-s", "gt-test-sentinel").Run()
 	}
 
 	code := m.Run()
