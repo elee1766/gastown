@@ -3,7 +3,6 @@ package web
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -64,6 +63,9 @@ type APIHandler struct {
 	cmdSem chan struct{}
 	// csrfToken is validated on POST requests to prevent cross-site request forgery.
 	csrfToken string
+	// A single event source is shared by all dashboard clients.
+	dashboardEvents     dashboardEvents
+	dashboardEventsOnce sync.Once
 }
 
 const optionsCacheTTL = 30 * time.Second
@@ -2177,104 +2179,44 @@ func parseCommandArgs(command string) []string {
 	return args
 }
 
-// handleSSE streams Server-Sent Events to the dashboard client.
-// It polls key dashboard state every 2 seconds and sends an event when
-// changes are detected, allowing the client to trigger a re-render.
-// Falls through gracefully if the client disconnects.
+// handleSSE streams shared refresh hints without spawning status subprocesses.
 func (h *APIHandler) handleSSE(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "SSE not supported", http.StatusInternalServerError)
 		return
 	}
+	h.dashboardEventsOnce.Do(func() { h.dashboardEvents.root = h.workDir })
+	updates, unsubscribe := h.dashboardEvents.subscribe()
+	defer unsubscribe()
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
-
-	ctx := r.Context()
-
-	// Send initial connection event
-	fmt.Fprintf(w, "event: connected\ndata: ok\n\n")
+	if _, err := fmt.Fprint(w, "event: connected\ndata: ok\n\n"); err != nil {
+		return
+	}
 	flusher.Flush()
 
-	var lastHash string
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	// Send keepalive comment every 15 seconds to prevent connection timeouts
 	keepalive := time.NewTicker(15 * time.Second)
 	defer keepalive.Stop()
-
 	for {
 		select {
-		case <-ctx.Done():
+		case <-r.Context().Done():
 			return
 		case <-keepalive.C:
-			fmt.Fprintf(w, ": keepalive\n\n")
-			flusher.Flush()
-		case <-ticker.C:
-			hash := h.computeDashboardHash(ctx)
-			if hash != "" && hash != lastHash {
-				lastHash = hash
-				fmt.Fprintf(w, "event: dashboard-update\ndata: %s\n\n", hash)
-				flusher.Flush()
+			if _, err := fmt.Fprint(w, ": keepalive\n\n"); err != nil {
+				return
 			}
+			flusher.Flush()
+		case <-updates:
+			if _, err := fmt.Fprint(w, "event: dashboard-update\ndata: refresh\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		}
 	}
-}
-
-// computeDashboardHash generates a lightweight hash of key dashboard state.
-// It runs quick commands in parallel and hashes their output to detect changes.
-func (h *APIHandler) computeDashboardHash(ctx context.Context) string {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	var mu sync.Mutex
-	var parts []string
-
-	var wg sync.WaitGroup
-	wg.Add(3)
-
-	// Check worker/polecat state
-	go func() {
-		defer wg.Done()
-		if out, err := h.runGtCommand(ctx, 3*time.Second, []string{"status", "--json"}); err == nil {
-			mu.Lock()
-			parts = append(parts, "status:"+out)
-			mu.Unlock()
-		}
-	}()
-
-	// Check hooks state
-	go func() {
-		defer wg.Done()
-		if out, err := h.runGtCommand(ctx, 3*time.Second, []string{"hooks", "list"}); err == nil {
-			mu.Lock()
-			parts = append(parts, "hooks:"+out)
-			mu.Unlock()
-		}
-	}()
-
-	// Check mail count
-	go func() {
-		defer wg.Done()
-		if out, err := h.runGtCommand(ctx, 3*time.Second, []string{"mail", "inbox"}); err == nil {
-			mu.Lock()
-			parts = append(parts, "mail:"+out)
-			mu.Unlock()
-		}
-	}()
-
-	wg.Wait()
-
-	if len(parts) == 0 {
-		return ""
-	}
-
-	h256 := sha256.Sum256([]byte(strings.Join(parts, "|")))
-	return fmt.Sprintf("%x", h256[:8])
 }
 
 // handleRigAdd creates a new rig, optionally with a local bare repo.

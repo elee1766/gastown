@@ -25,39 +25,73 @@
     var sseReconnectDelay = 1000;
     var sseMaxReconnectDelay = 30000;
 
-    function connectSSE() {
-        if (evtSource) {
-            evtSource.close();
+    var sseReconnectTimer = null;
+    var dashboardCatchUp = false;
+
+    function refreshDashboard() {
+        if (document.hidden || window.pauseRefresh) return;
+        var dashboard = document.getElementById('dashboard-main');
+        if (dashboard && typeof htmx !== 'undefined') {
+            htmx.trigger(dashboard, 'sse:dashboard-update');
         }
+    }
 
-        evtSource = new EventSource('/api/events');
+    function disconnectSSE() {
+        if (sseReconnectTimer) clearTimeout(sseReconnectTimer);
+        sseReconnectTimer = null;
+        if (evtSource) evtSource.close();
+        evtSource = null;
+        window.sseConnected = false;
+    }
 
-        evtSource.addEventListener('connected', function() {
+    function connectSSE() {
+        if (document.hidden || evtSource) return;
+        var source = new EventSource('/api/events');
+        evtSource = source;
+
+        source.addEventListener('connected', function() {
+            if (evtSource !== source) return;
             window.sseConnected = true;
             sseReconnectDelay = 1000;
             updateConnectionStatus('live');
-        });
-
-        evtSource.addEventListener('dashboard-update', function(e) {
-            if (window.pauseRefresh) return;
-            // Trigger HTMX to re-fetch the dashboard
-            var dashboard = document.getElementById('dashboard-main');
-            if (dashboard && typeof htmx !== 'undefined') {
-                htmx.trigger(dashboard, 'sse:dashboard-update');
+            if (dashboardCatchUp) {
+                dashboardCatchUp = false;
+                refreshDashboard();
             }
         });
 
-        evtSource.onerror = function() {
-            window.sseConnected = false;
+        source.addEventListener('dashboard-update', function() {
+            if (evtSource === source) refreshDashboard();
+        });
+
+        source.onerror = function() {
+            if (evtSource !== source) return;
+            disconnectSSE();
+            dashboardCatchUp = true;
             updateConnectionStatus('reconnecting');
-            evtSource.close();
-            // Exponential backoff reconnect
-            setTimeout(function() {
+            if (document.hidden) return;
+            sseReconnectTimer = setTimeout(function() {
+                sseReconnectTimer = null;
                 sseReconnectDelay = Math.min(sseReconnectDelay * 2, sseMaxReconnectDelay);
                 connectSSE();
             }, sseReconnectDelay);
         };
     }
+
+    document.addEventListener('visibilitychange', function() {
+        if (document.hidden) {
+            dashboardCatchUp = true;
+            disconnectSSE();
+            updateConnectionStatus('paused');
+        } else {
+            connectSSE();
+        }
+    });
+    window.addEventListener('pagehide', function() {
+        dashboardCatchUp = true;
+        disconnectSSE();
+    });
+    window.addEventListener('pageshow', connectSSE);
 
     function updateConnectionStatus(state) {
         var el = document.getElementById('connection-status');
@@ -66,6 +100,10 @@
             case 'live':
                 el.textContent = 'Live';
                 el.className = 'connection-live';
+                break;
+            case 'paused':
+                el.textContent = 'Paused';
+                el.className = '';
                 break;
             case 'reconnecting':
                 el.textContent = 'Reconnecting...';
@@ -2991,6 +3029,7 @@
     // SESSION TERMINAL PREVIEW
     // ============================================
     var sessionPreviewInterval = null;
+    var sessionPreviewInFlight = false;
     var sessionsTable = null; // will be set when opening preview
 
     // Click on session row to preview terminal output
@@ -3037,6 +3076,8 @@
     }
 
     function fetchSessionPreview(sessionName, contentEl, statusEl) {
+        if (document.hidden || sessionPreviewInFlight) return;
+        sessionPreviewInFlight = true;
         fetch('/api/session/preview?session=' + encodeURIComponent(sessionName))
             .then(function(r) { return r.json(); })
             .then(function(data) {
@@ -3054,7 +3095,8 @@
             })
             .catch(function(err) {
                 contentEl.textContent = 'Failed to load preview: ' + err.message;
-            });
+            })
+            .finally(function() { sessionPreviewInFlight = false; });
     }
 
     function closeSessionPreview() {

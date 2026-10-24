@@ -182,6 +182,15 @@ func (h *ConvoyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *ConvoyHandler) invalidateCache() {
+	h.cacheMu.Lock()
+	h.cacheTime = time.Time{}
+	h.cacheMu.Unlock()
+	h.expandCacheMu.Lock()
+	h.expandCache = nil
+	h.expandCacheMu.Unlock()
+}
+
 // fetchAndRender runs all 14 fetchers in parallel and renders the template.
 // Returns the rendered HTML bytes, or nil on template error.
 func (h *ConvoyHandler) fetchAndRender(r *http.Request, expandPanel string) []byte {
@@ -472,6 +481,7 @@ func NewDashboardMux(fetcher ConvoyFetcher, webCfg *config.WebTimeoutsConfig) (h
 	defaultRunTimeout := config.ParseDurationOrDefault(webCfg.DefaultRunTimeout, 30*time.Second)
 	maxRunTimeout := config.ParseDurationOrDefault(webCfg.MaxRunTimeout, 60*time.Second)
 	apiHandler := NewAPIHandler(defaultRunTimeout, maxRunTimeout, csrfToken)
+	apiHandler.dashboardEvents.invalidate = convoyHandler.invalidateCache
 
 	// Create static file server from embedded files
 	staticFS, err := fs.Sub(staticFiles, "static")
