@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/cli"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/polecat"
@@ -318,6 +319,7 @@ func checkStaleBinaryWarning() {
 // Execute runs the root command and returns an exit code.
 // The caller (main) should call os.Exit with this code.
 func Execute() int {
+	defer beads.CloseIdleSDKStores()
 	if !isDoneInvocation(os.Args[1:]) {
 		ctx := context.Background()
 		provider, err := telemetry.Init(ctx, "gastown", Version)

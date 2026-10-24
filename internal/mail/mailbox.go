@@ -144,6 +144,8 @@ func (m *Mailbox) listBeads() ([]*Message, error) {
 // memory footprint under concurrent agent load. A separate CC query fetches
 // messages where this identity is CC'd.
 func (m *Mailbox) listFromDir(beadsDir string) ([]*Message, error) {
+	m, releaseSDK := m.withSDK(beadsDir)
+	defer releaseSDK()
 	// Use in-process store when available
 	if m.store != nil {
 		return m.storeListFromDir()
@@ -521,6 +523,8 @@ func (m *Mailbox) getBeads(id string) (*Message, error) {
 
 // getFromDir retrieves a message from a beads directory.
 func (m *Mailbox) getFromDir(id, beadsDir string) (*Message, error) {
+	m, releaseSDK := m.withSDK(beadsDir)
+	defer releaseSDK()
 	if m.store != nil {
 		return m.storeGetFromDir(id)
 	}
@@ -593,6 +597,8 @@ func (m *Mailbox) markReadBeads(id string) error {
 
 // closeInDir closes a message in a specific beads directory.
 func (m *Mailbox) closeInDir(id, beadsDir string) error {
+	m, releaseSDK := m.withSDK(beadsDir)
+	defer releaseSDK()
 	if m.store != nil {
 		return m.storeCloseInDir(id)
 	}
@@ -663,8 +669,8 @@ func (m *Mailbox) markReadOnlyBeads(id string) error {
 		return err
 	}
 
-	if m.store != nil {
-		return m.storeMarkReadOnly(id)
+	if handled, err := m.sdkMutation(id, func(target *Mailbox) error { return target.storeMarkReadOnly(id) }); handled {
+		return err
 	}
 
 	// Add "read" label to mark as read without closing
@@ -701,8 +707,8 @@ func (m *Mailbox) acknowledgeDeliveryForPrimary(id string) error {
 	if m.legacy {
 		return nil
 	}
-	if m.store != nil {
-		return m.storeAcknowledgeDeliveryForPrimary(id)
+	if handled, err := m.sdkMutation(id, func(target *Mailbox) error { return target.storeAcknowledgeDeliveryForPrimary(id) }); handled {
+		return err
 	}
 
 	msg, err := m.Get(id)
@@ -731,8 +737,8 @@ func (m *Mailbox) MarkUnreadOnly(id string) error {
 }
 
 func (m *Mailbox) markUnreadOnlyBeads(id string) error {
-	if m.store != nil {
-		return m.storeMarkUnreadOnly(id)
+	if handled, err := m.sdkMutation(id, func(target *Mailbox) error { return target.storeMarkUnreadOnly(id) }); handled {
+		return err
 	}
 
 	// Remove "read" label to mark as unread
@@ -781,8 +787,8 @@ func (m *Mailbox) MarkUnread(id string) error {
 }
 
 func (m *Mailbox) markUnreadBeads(id string) error {
-	if m.store != nil {
-		return m.storeMarkUnread(id)
+	if handled, err := m.sdkMutation(id, func(target *Mailbox) error { return target.storeMarkUnread(id) }); handled {
+		return err
 	}
 
 	args := []string{"reopen", id}

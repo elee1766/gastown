@@ -621,7 +621,7 @@ func (b *Beads) ForAgentBead() *Beads {
 		beadsDir:   townBeadsDir,
 		isolated:   b.isolated,
 		serverPort: b.serverPort,
-		store:      b.store,
+		store:      b.agentStore(townBeadsDir),
 		townRoot:   townRoot,
 		noRoute:    true,
 	}
@@ -1058,6 +1058,8 @@ func stripEnvPrefixes(environ []string, prefixes ...string) []string {
 // wisps table (where ephemeral issues live in beads v0.59+). Without this,
 // "bd list" only searches the issues table and misses wisps entirely.
 func (b *Beads) List(opts ListOptions) ([]*Issue, error) {
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeList(opts)
 	}
@@ -1138,16 +1140,20 @@ func (b *Beads) ListIssueStatuses(statuses ...IssueStatus) ([]*Issue, error) {
 		return nil, nil
 	}
 
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
-		var all []*Issue
+		ctx, cancel := storeCtx()
+		defer cancel()
+		filter := beadsdk.IssueFilter{SkipWisps: true}
 		for _, status := range unique {
-			issues, err := b.storeList(ListOptions{Status: string(status), Priority: -1})
-			if err != nil {
-				return nil, err
-			}
-			all = append(all, issues...)
+			filter.Statuses = append(filter.Statuses, beadsdk.Status(status))
 		}
-		return all, nil
+		issues, err := b.store.SearchIssues(ctx, "", filter)
+		if err != nil {
+			return nil, fmt.Errorf("store list statuses: %w", err)
+		}
+		return sdkIssuesToIssues(issues), nil
 	}
 
 	statusClauses := make([]string, 0, len(unique))
@@ -1486,6 +1492,8 @@ func (b *Beads) GetAssignedIssue(assignee string) (*Issue, error) {
 
 // Ready returns issues that are ready to work (not blocked).
 func (b *Beads) Ready() ([]*Issue, error) {
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeReady()
 	}
@@ -1508,6 +1516,9 @@ func (b *Beads) Ready() ([]*Issue, error) {
 // (blocked_issues_cache), handling all blocking types, transitive propagation,
 // and conditional-blocks resolution.
 func (b *Beads) ReadyForMol(moleculeID string) ([]*Issue, error) {
+	b = b.forIssueID(moleculeID)
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeReadyWithFilter(beadsdk.WorkFilter{
 			ParentID: &moleculeID,
@@ -1532,6 +1543,8 @@ func (b *Beads) ReadyForMol(moleculeID string) ([]*Issue, error) {
 // Uses bd ready --label flag for server-side filtering.
 // The issueType is converted to a gt:<type> label (e.g., "molecule" -> "gt:molecule").
 func (b *Beads) ReadyWithType(issueType string) ([]*Issue, error) {
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeReadyWithFilter(beadsdk.WorkFilter{
 			Labels: []string{"gt:" + issueType},
@@ -1560,6 +1573,8 @@ func (b *Beads) Show(id string) (*Issue, error) {
 		}
 	}
 
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeShow(id)
 	}
@@ -1659,6 +1674,8 @@ func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
 		return make(map[string]*Issue), nil
 	}
 
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeShowMultiple(ids)
 	}
@@ -1685,6 +1702,8 @@ func (b *Beads) showMultipleLocal(ids []string) (map[string]*Issue, error) {
 
 // Blocked returns issues that are blocked by dependencies.
 func (b *Beads) Blocked() ([]*Issue, error) {
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeBlocked()
 	}
@@ -1725,7 +1744,9 @@ func (b *Beads) Create(opts CreateOptions) (*Issue, error) {
 		return bdForCreate.Create(opts)
 	}
 
-	if b.store != nil && !opts.Ephemeral {
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
+	if b.store != nil {
 		return b.storeCreate(opts)
 	}
 
@@ -1859,6 +1880,8 @@ type SearchOptions struct {
 
 // Search searches issues by text query across title, description, and ID.
 func (b *Beads) Search(opts SearchOptions) ([]*Issue, error) {
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeSearch(opts)
 	}
@@ -1969,6 +1992,8 @@ func (b *Beads) Update(id string, opts UpdateOptions) error {
 		}
 	}
 
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		return b.storeUpdate(id, opts)
 	}
@@ -2034,8 +2059,12 @@ func (b *Beads) Comments(id string) ([]Comment, error) {
 		}
 	}
 
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
-		comments, err := b.store.GetIssueComments(context.Background(), id)
+		ctx, cancel := storeCtx()
+		defer cancel()
+		comments, err := b.store.GetIssueComments(ctx, id)
 		if err != nil {
 			return nil, err
 		}
@@ -2121,13 +2150,21 @@ func (b *Beads) closeWithOptions(opts closeOptions, ids ...string) error {
 }
 
 func (b *Beads) closeInCurrentDB(opts closeOptions, ids ...string) error {
-	// In-process store close doesn't enforce dependency checks (no --force
-	// needed). Note: this means the store path bypasses the dependency
-	// validation that the CLI's --force flag overrides. Callers relying on
-	// ForceCloseWithReason (e.g., gt done nuking polecat wisps) are already
-	// accepting that deps may remain dangling, so this is intentional.
+	// Preserve CLI-only gate validation and molecule completion before any write.
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
-		return b.storeClose(opts.reason, runtime.SessionIDFromEnv(), ids...)
+		compatible, err := b.storeCloseCompatible(opts, ids)
+		if err != nil {
+			return err
+		}
+		if compatible {
+			reason := opts.reason
+			if !opts.withReason {
+				reason = "Closed"
+			}
+			return b.storeClose(reason, runtime.SessionIDFromEnv(), ids...)
+		}
 	}
 
 	args := append([]string{"close"}, ids...)
@@ -2157,6 +2194,9 @@ func (b *Beads) Release(id string) error {
 // ReleaseWithReason moves an in_progress issue back to open status with a reason.
 // The reason is added as a note to the issue for tracking purposes.
 func (b *Beads) ReleaseWithReason(id, reason string) error {
+	b = b.forIssueID(id)
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
 	if b.store != nil {
 		updates := map[string]interface{}{
 			"status":   "open",
@@ -2183,7 +2223,10 @@ func (b *Beads) ReleaseWithReason(id, reason string) error {
 
 // AddDependency adds a dependency: issue depends on dependsOn.
 func (b *Beads) AddDependency(issue, dependsOn string) error {
-	if b.store != nil {
+	b = b.forIssueID(issue)
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
+	if b.store != nil && b.sdkDependencyLocal(dependsOn) {
 		return b.storeAddDependency(issue, dependsOn)
 	}
 
@@ -2193,7 +2236,10 @@ func (b *Beads) AddDependency(issue, dependsOn string) error {
 
 // RemoveDependency removes a dependency.
 func (b *Beads) RemoveDependency(issue, dependsOn string) error {
-	if b.store != nil {
+	b = b.forIssueID(issue)
+	b, releaseSDK := b.withSDK()
+	defer releaseSDK()
+	if b.store != nil && b.sdkDependencyLocal(dependsOn) {
 		return b.storeRemoveDependency(issue, dependsOn)
 	}
 

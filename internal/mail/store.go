@@ -12,6 +12,7 @@ import (
 	"time"
 
 	beadsdk "github.com/steveyegge/beads"
+	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/runtime"
 	"github.com/steveyegge/gastown/internal/telemetry"
 )
@@ -52,6 +53,52 @@ func NewMailboxWithBeadsDirAndStore(address, workDir, beadsDir string, store bea
 	}
 }
 
+// withSDK leases the requested database without changing the shared mailbox.
+func (m *Mailbox) withSDK(dir string) (*Mailbox, func()) {
+	if m.store != nil || m.legacy {
+		return m, func() {}
+	}
+	if dir == "" {
+		dir = beads.ResolveBeadsDir(m.workDir)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	store, release, err := beads.AcquireSDKStore(ctx, dir)
+	if err != nil {
+		return m, func() {}
+	}
+	copy := *m
+	copy.store = store
+	return &copy, release
+}
+
+// sdkMutation resolves a routed message, including messages stored in the home database.
+func (m *Mailbox) sdkMutation(id string, mutate func(*Mailbox) error) (bool, error) {
+	dir := m.beadsDir
+	if dir == "" {
+		dir = beads.ResolveBeadsDir(m.workDir)
+	}
+	primary := beads.ResolveBeadsDirForID(dir, id)
+	target, release := m.withSDK(primary)
+	defer release()
+	if target.store == nil {
+		return false, nil
+	}
+	_, err := target.storeGetFromDir(id)
+	if err == ErrMessageNotFound && primary != dir {
+		target, release = m.withSDK(dir)
+		defer release()
+		if target.store == nil {
+			return false, nil
+		}
+		_, err = target.storeGetFromDir(id)
+	}
+	if err != nil {
+		return true, err
+	}
+	return true, mutate(target)
+}
+
 // mailStoreCtx returns a context with a standard timeout for mail store operations.
 func mailStoreCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), 30*time.Second)
@@ -88,6 +135,18 @@ func (m *Mailbox) storeListFromDir() ([]*Message, error) {
 				continue
 			}
 			if si.Status == beadsdk.StatusOpen || string(si.Status) == "hooked" {
+				seen[si.ID] = true
+				messages = append(messages, sdkIssueToMessage(si))
+			}
+		}
+		ccIssues, err := m.store.SearchIssues(ctx, "", beadsdk.IssueFilter{
+			Labels: []string{"gt:message", "cc:" + id},
+		})
+		if err != nil {
+			return nil, fmt.Errorf("store list CC messages: %w", err)
+		}
+		for _, si := range ccIssues {
+			if !seen[si.ID] && si.Status == beadsdk.StatusOpen {
 				seen[si.ID] = true
 				messages = append(messages, sdkIssueToMessage(si))
 			}

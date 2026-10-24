@@ -278,6 +278,19 @@ func (b *Beads) storeList(opts ListOptions) ([]*Issue, error) {
 	defer cancel()
 
 	filter := issueFilterFromListOpts(opts)
+	if opts.Status == "" && !opts.Ephemeral {
+		filter.ExcludeStatus = []beadsdk.Status{beadsdk.StatusClosed, beadsdk.Status("pinned")}
+		custom, err := b.store.GetConfig(ctx, "status.custom")
+		if err != nil {
+			return nil, fmt.Errorf("store list status configuration: %w", err)
+		}
+		for _, entry := range strings.Split(custom, ",") {
+			name, category, _ := strings.Cut(strings.TrimSpace(entry), ":")
+			if category == "done" || category == "frozen" {
+				filter.ExcludeStatus = append(filter.ExcludeStatus, beadsdk.Status(name))
+			}
+		}
+	}
 	sdkIssues, err := b.store.SearchIssues(ctx, "", filter)
 	if err != nil {
 		return nil, fmt.Errorf("store list: %w", err)
@@ -358,10 +371,15 @@ func (b *Beads) storeCreate(opts CreateOptions) (*Issue, error) {
 	ctx, cancel := storeCtx()
 	defer cancel()
 
+	if opts.Priority < 0 {
+		opts.Priority = 2
+	}
 	sdkIssue := &beadsdk.Issue{
 		Title:       opts.Title,
 		Description: opts.Description,
 		Priority:    opts.Priority,
+		Status:      beadsdk.StatusOpen,
+		IssueType:   beadsdk.TypeTask,
 		Ephemeral:   opts.Ephemeral,
 	}
 
@@ -481,19 +499,13 @@ func (b *Beads) storeClose(reason, session string, ids ...string) error {
 
 // storeReady implements Ready using the in-process store.
 func (b *Beads) storeReady() ([]*Issue, error) {
-	ctx, cancel := storeCtx()
-	defer cancel()
-
-	sdkIssues, err := b.store.GetReadyWork(ctx, beadsdk.WorkFilter{})
-	if err != nil {
-		return nil, fmt.Errorf("store ready: %w", err)
-	}
-
-	return sdkIssuesToIssues(sdkIssues), nil
+	return b.storeReadyWithFilter(beadsdk.WorkFilter{Limit: 100})
 }
 
 // storeReadyWithFilter implements Ready with a WorkFilter using the in-process store.
 func (b *Beads) storeReadyWithFilter(filter beadsdk.WorkFilter) ([]*Issue, error) {
+	filter.Status = beadsdk.StatusOpen
+	filter.SortPolicy = beadsdk.SortPolicy("priority")
 	ctx, cancel := storeCtx()
 	defer cancel()
 
@@ -525,6 +537,9 @@ func (b *Beads) storeBlocked() ([]*Issue, error) {
 
 // storeSearch implements Search using the in-process store.
 func (b *Beads) storeSearch(opts SearchOptions) ([]*Issue, error) {
+	if opts.Limit <= 0 {
+		opts.Limit = 50
+	}
 	ctx, cancel := storeCtx()
 	defer cancel()
 
@@ -535,6 +550,8 @@ func (b *Beads) storeSearch(opts SearchOptions) ([]*Issue, error) {
 	if opts.Status != "" && opts.Status != "all" {
 		status := beadsdk.Status(opts.Status)
 		filter.Status = &status
+	} else if opts.Status == "" {
+		filter.ExcludeStatus = []beadsdk.Status{beadsdk.StatusClosed}
 	}
 
 	if opts.Label != "" {

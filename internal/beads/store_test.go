@@ -212,6 +212,18 @@ func (m *mockStorage) SearchIssues(_ context.Context, query string, filter beads
 	return result, nil
 }
 
+func (m *mockStorage) GetConfig(_ context.Context, _ string) (string, error) { return "", nil }
+
+func (m *mockStorage) IsBlocked(_ context.Context, id string) (bool, []string, error) {
+	var blockers []string
+	for _, dep := range m.deps[id] {
+		if issue := m.issues[dep]; issue != nil && issue.Status != beadsdk.StatusClosed {
+			blockers = append(blockers, dep)
+		}
+	}
+	return len(blockers) > 0, blockers, nil
+}
+
 func (m *mockStorage) AddDependency(_ context.Context, dep *beadsdk.Dependency, _ string) error {
 	if m.addDepErr != nil {
 		return m.addDepErr
