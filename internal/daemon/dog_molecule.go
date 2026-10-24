@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 )
 
@@ -48,6 +49,7 @@ func (dm *dogMol) closeWisp(id string, extra ...string) error {
 // Graceful degradation: if bd fails, the dog still does its work — molecule
 // tracking is observability, not control flow.
 type dogMol struct {
+	store    beadsdk.Storage
 	rootID   string            // Root wisp ID (e.g., "gt-wisp-abc123"), empty if pour failed.
 	stepIDs  map[string]string // step slug -> wisp issue ID
 	bdPath   string
@@ -59,7 +61,9 @@ type dogMol struct {
 // Returns a dogMol handle for closing steps. If bd fails, returns a no-op
 // handle so the caller can proceed without error checking.
 func (d *Daemon) pourDogMolecule(formulaName string, vars map[string]string) *dogMol {
+	store, _ := d.nativeStore("hq")
 	dm := &dogMol{
+		store:    store,
 		stepIDs:  make(map[string]string),
 		bdPath:   d.bdPath,
 		townRoot: d.config.TownRoot,
@@ -336,6 +340,27 @@ func (dm *dogMol) knownSteps() []string {
 
 // runBd executes a bd command and returns stdout.
 func (dm *dogMol) runBd(args ...string) (string, error) {
+	if dm.store != nil && len(args) >= 2 {
+		ctx, cancel := context.WithTimeout(context.Background(), bdMolTimeout)
+		defer cancel()
+		switch args[0] {
+		case "close":
+			reason := ""
+			for i := 2; i+1 < len(args); i++ {
+				if args[i] == "--reason" || args[i] == "-r" {
+					reason = args[i+1]
+				}
+			}
+			return "", dm.store.CloseIssue(ctx, args[1], reason, "daemon", "")
+		case "show":
+			children, err := dm.store.SearchIssues(ctx, "", beadsdk.IssueFilter{ParentID: &args[1]})
+			if err != nil {
+				return "", err
+			}
+			data, err := json.Marshal(children)
+			return string(data), err
+		}
+	}
 	bdPath := dm.bdPath
 	if bdPath == "" {
 		bdPath = "bd"

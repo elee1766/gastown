@@ -41,6 +41,18 @@ The daemon requires a durable `<prefix>-rig-<name>` identity record to verify th
 
 The convoy event poller waits for the headquarters store before retaining per-rig stores. This avoids a partial startup that permanently skips convoy lookups after headquarters briefly fails to connect.
 
+## Retained daemon APIs
+
+The daemon borrows its long-lived HQ and rig stores for lifecycle inbox reads/deletes, agent state and hook checks, assigned-work checks, crash notifications, and patrol-step reads/closes. Unavailable stores fail safely instead of starting repeated CLI fallback processes. An empty scheduler queue is checked natively before launching the dispatcher.
+
+Convoy event batches request one scan rather than one subprocess per issue. The scan reads scheduling contexts once per database and resolves raw dependency records against each owning store. The SDK's joined dependency API omits targets absent from the local database, so it must not be used to establish cross-rig completion. Missing work remains unresolved, never complete. Assigned work is left to witness recovery rather than repeatedly slung by the convoy poller. Failed dispatches back off from one to five minutes.
+
+Completed convoys close through the SDK, export durable issue records atomically before notification, and write completion mail through the retained HQ store. A completion marker prevents repeat notification after a successful pass. The startup scan joins shutdown before stores are closed.
+
+This is not a process-free town. Actual worker dispatch still invokes `gt sling`, and a nonempty scheduler queue still enters the existing dispatcher. Formula pouring, administrative commands, Git operations, and agent-authored `bd` commands remain subprocess boundaries. Native patrol closes still perform Beads dependency propagation; eliminating connection setup does not eliminate that database work.
+
+`TestNativeConvoyLifecycle` runs with no CLI on PATH and covers assigned work, unassigned dispatch readiness, cross-store completion, durable export and repeat completion. Polecat health scenarios use disposable real SQL stores, including crash mail and protecting active/assigned work. Set `GT_TEST_SDK_HOST` to a disposable server on port 3306 for those tests.
+
 ## Validation
 
 `internal/beads/sdk_acceptance_test.go` exercises the normal constructors against a disposable real Dolt server with `bd` absent from `PATH`. It covers all 25 adapters, routed databases, agent-bead routing, CC/wisp mail, delivery acknowledgment, default filters, blocked closure and read-only configuration. Without SDK activation it fails at the first create because `bd` is unavailable.

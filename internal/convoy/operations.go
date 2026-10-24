@@ -13,6 +13,8 @@ import (
 
 	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
+	"github.com/steveyegge/gastown/internal/mail"
+	"github.com/steveyegge/gastown/internal/tmux"
 	"github.com/steveyegge/gastown/internal/util"
 )
 
@@ -74,8 +76,15 @@ func CheckConvoysForIssue(ctx context.Context, store beadsdk.Storage, townRoot, 
 		}
 
 		logger("%s: checking convoy %s", caller, convoyID)
-		if err := runConvoyCheck(ctx, townRoot, convoyID, gtPath); err != nil {
-			logger("%s: convoy %s check failed: %s", caller, convoyID, util.FirstLine(err.Error()))
+		var checkErr error
+		if res != nil {
+			checkErr = Complete(ctx, townRoot, res.stores, convoyID)
+		} else {
+			checkErr = runConvoyCheck(ctx, townRoot, convoyID, gtPath)
+		}
+		if checkErr != nil {
+			logger("%s: convoy %s check failed: %s", caller, convoyID, util.FirstLine(checkErr.Error()))
+			continue
 		}
 
 		// Continuation feed: if convoy is still open after the completion check,
@@ -597,10 +606,10 @@ func FireCrossRigDepNotifications(ctx context.Context, closedIssueID, townRoot s
 
 			msg := fmt.Sprintf("Dependency resolved: %s — External dependency %s has closed. Unblocked: %s (%s). This issue may now proceed.",
 				closedIssueID, closedIssueID, depID, depTitle)
-			nudgeCmd := exec.Command("gt", "nudge", depRig+"/witness", "-m", msg)
-			nudgeCmd.Dir = townRoot
-			if err := nudgeCmd.Run(); err != nil {
-				logger("CrossRig: nudge %s/witness failed: %v", depRig, err)
+			for _, target := range mail.AddressToSessionIDs(depRig + "/witness") {
+				if err := tmux.NewTmux().NudgeSessionWithOpts(target, msg, tmux.NudgeOpts{TownRoot: townRoot}); err != nil {
+					logger("CrossRig: nudge %s/witness failed: %v", depRig, err)
+				}
 			}
 		}
 	}

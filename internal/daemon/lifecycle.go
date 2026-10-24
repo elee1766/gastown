@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -41,29 +42,20 @@ const MaxLifecycleMessageAge = 6 * time.Hour
 
 // ProcessLifecycleRequests checks for and processes lifecycle requests from the deacon inbox.
 func (d *Daemon) ProcessLifecycleRequests() {
-	// Get mail for deacon identity (using gt mail, not bd mail)
-	cmd := exec.Command(d.gtPath, "mail", "inbox", "--identity", "deacon/", "--json")
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
-	util.SetDetachedProcessGroup(cmd)
-
-	output, err := cmd.Output()
+	mailbox, err := d.nativeMailbox("deacon/")
+	if err != nil {
+		d.logger.Printf("Warning: failed to open deacon inbox: %v", err)
+		return
+	}
+	inbox, err := mailbox.List()
 	if err != nil {
 		d.logger.Printf("Warning: failed to fetch deacon inbox: %v", err)
 		return
 	}
-
-	if len(output) == 0 || string(output) == "[]" || string(output) == "[]\n" {
-		return
-	}
-
-	var messages []BeadsMessage
-	if err := json.Unmarshal(output, &messages); err != nil {
-		d.logger.Printf("Error parsing mail: %v", err)
-		return
-	}
-
-	for _, msg := range messages {
+	for _, message := range inbox {
+		msg := BeadsMessage{ID: message.ID, From: message.From, To: message.To,
+			Subject: message.Subject, Body: message.Body,
+			Timestamp: message.Timestamp.Format(time.RFC3339), Read: message.Read}
 		if msg.Read {
 			continue // Already processed
 		}
@@ -798,15 +790,12 @@ func (d *Daemon) resetSyncFailures(workDir string) {
 // We use delete instead of read because gt mail read intentionally
 // doesn't mark messages as read (to preserve handoff messages).
 func (d *Daemon) closeMessage(id string) error {
-	// Use gt mail delete to actually remove the message
-	cmd := exec.Command(d.gtPath, "mail", "delete", id)
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = os.Environ() // Inherit PATH to find gt executable
-	util.SetDetachedProcessGroup(cmd)
-
-	output, err := cmd.CombinedOutput()
+	mailbox, err := d.nativeMailbox("deacon/")
 	if err != nil {
-		return fmt.Errorf("gt mail delete %s: %v (output: %s)", id, err, string(output))
+		return err
+	}
+	if err := mailbox.Delete(id); err != nil {
+		return fmt.Errorf("deleting lifecycle message %s: %w", id, err)
 	}
 	d.logger.Printf("Deleted lifecycle message: %s", id)
 	return nil
@@ -846,38 +835,9 @@ func (d *Daemon) getAgentBeadState(agentBeadID string) (string, error) {
 // kills mid-work after 3x threshold (hq-3kri). Pin the lookup to the town
 // .beads so the reaper sees the truth.
 func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
-	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
-	util.SetDetachedProcessGroup(cmd)
-
-	output, err := cmd.Output()
+	issue, err := d.nativeAgentIssue(agentBeadID)
 	if err != nil {
-		return nil, fmt.Errorf("bd show %s: %w", agentBeadID, err)
-	}
-
-	// bd show --json returns an array with one element
-	var issues []struct {
-		ID          string   `json:"id"`
-		Type        string   `json:"issue_type"`
-		Labels      []string `json:"labels"`
-		Description string   `json:"description"`
-		UpdatedAt   string   `json:"updated_at"`
-		HookBead    string   `json:"hook_bead"`   // Read from database column
-		AgentState  string   `json:"agent_state"` // Read from database column
-	}
-
-	if err := json.Unmarshal(output, &issues); err != nil {
-		return nil, fmt.Errorf("parsing bd show output: %w", err)
-	}
-
-	if len(issues) == 0 {
-		return nil, fmt.Errorf("agent bead not found: %s", agentBeadID)
-	}
-
-	issue := issues[0]
-	if !beads.IsAgentBead(&beads.Issue{Type: issue.Type, Labels: issue.Labels}) {
-		return nil, fmt.Errorf("bead %s is not an agent bead (type=%s)", agentBeadID, issue.Type)
+		return nil, err
 	}
 
 	// Parse agent fields from description for role/state info
@@ -885,8 +845,8 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 
 	info := &AgentBeadInfo{
 		ID:         issue.ID,
-		Type:       issue.Type,
-		LastUpdate: issue.UpdatedAt,
+		Type:       string(issue.IssueType),
+		LastUpdate: issue.UpdatedAt.Format(time.RFC3339),
 	}
 
 	if fields != nil {
@@ -894,11 +854,8 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 		info.Rig = fields.Rig
 	}
 
-	info.State = beads.ResolveAgentState(issue.Description, issue.AgentState)
-
-	// Use HookBead from database column directly (not from description)
-	// The description may contain stale data - the slot is the source of truth.
-	info.HookBead = issue.HookBead
+	info.State = beads.ResolveAgentState(issue.Description, "")
+	info.HookBead = fields.HookBead
 
 	return info, nil
 }
@@ -907,23 +864,11 @@ func (d *Daemon) getAgentBeadInfo(agentBeadID string) (*AgentBeadInfo, error) {
 // Used for TOCTOU re-verification before taking destructive action on agents.
 // Returns empty string on error or if no hook_bead is set.
 func (d *Daemon) getAgentHookBead(agentBeadID string) string {
-	cmd := exec.Command(d.bdPath, "show", agentBeadID, "--json")
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
-	util.SetDetachedProcessGroup(cmd)
-
-	output, err := cmd.Output()
+	issue, err := d.nativeAgentIssue(agentBeadID)
 	if err != nil {
 		return ""
 	}
-
-	var issues []struct {
-		HookBead string `json:"hook_bead"`
-	}
-	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
-		return ""
-	}
-	return issues[0].HookBead
+	return beads.ParseAgentFields(issue.Description).HookBead
 }
 
 // identityToAgentBeadID maps a daemon identity to an agent bead ID.
@@ -996,34 +941,48 @@ const GUPPViolationTimeout = constants.GUPPViolationTimeout
 
 // listAgentBeadsJSON queries both the issues and wisps tables for agent beads
 // and unmarshals the combined results into the provided slice pointer.
-// The wisps query is best-effort (gracefully ignored if table doesn't exist).
+// Both queries must succeed so unavailable state is not mistaken for absence.
 func (d *Daemon) listAgentBeadsJSON(dest interface{}) error {
-	// Query issues table (backward compat during migration)
-	cmd := exec.Command(d.bdPath, "list", "--label=gt:agent", "--json", "--flat") //nolint:gosec // G204: bd is a trusted internal tool
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
-	util.SetDetachedProcessGroup(cmd)
-
-	issuesOutput, issuesErr := cmd.Output()
-
-	// Query wisps table (primary source after agent bead migration)
-	wispCmd := exec.Command(d.bdPath, "mol", "wisp", "list", "--json") //nolint:gosec // G204: bd is a trusted internal tool
-	wispCmd.Dir = d.config.TownRoot
-	wispCmd.Env = bdReadOnlyPinnedEnv(filepath.Join(d.config.TownRoot, ".beads"))
-	util.SetDetachedProcessGroup(wispCmd)
-
-	wispOutput, _ := wispCmd.Output() // Best-effort: wisps table may not exist
-
-	// Merge results: parse wisps first, then issues (wisps take precedence)
+	store, err := d.nativeStore("hq")
+	if err != nil {
+		return err
+	}
+	issues, err := store.SearchIssues(d.ctx, "", beadsdk.IssueFilter{Labels: []string{"gt:agent"}})
+	if err != nil {
+		return err
+	}
+	wisps, err := store.ListWisps(d.ctx, beadsdk.WispFilter{})
+	if err != nil {
+		return err
+	}
+	issuesOutput, err := marshalAgentIssues(issues)
+	if err != nil {
+		return err
+	}
+	wispOutput, err := marshalAgentIssues(wisps)
+	if err != nil {
+		return err
+	}
 	combined := mergeAgentBeadJSON(wispOutput, issuesOutput)
 	if combined == nil {
-		if issuesErr != nil {
-			return fmt.Errorf("bd list failed: %w", issuesErr)
-		}
-		return fmt.Errorf("no agent beads found")
+		combined = []byte("[]")
 	}
-
 	return json.Unmarshal(combined, dest)
+}
+
+// marshalAgentIssues exposes the description-backed fields consumed by patrols.
+func marshalAgentIssues(issues []*beadsdk.Issue) ([]byte, error) {
+	type agentIssue struct {
+		*beadsdk.Issue
+		HookBead   string `json:"hook_bead"`
+		AgentState string `json:"agent_state"`
+	}
+	entries := make([]agentIssue, 0, len(issues))
+	for _, issue := range issues {
+		fields := beads.ParseAgentFields(issue.Description)
+		entries = append(entries, agentIssue{Issue: issue, HookBead: fields.HookBead, AgentState: fields.AgentState})
+	}
+	return json.Marshal(entries)
 }
 
 // mergeAgentBeadJSON merges JSON arrays from wisps and issues queries.
@@ -1180,12 +1139,7 @@ stuck_duration: %v
 Action needed: Check if agent is alive and responsive. Consider restarting if stuck.`,
 		agentID, hookBead, stuckDuration.Round(time.Minute))
 
-	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body)
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = os.Environ() // Inherit PATH to find gt executable
-	util.SetDetachedProcessGroup(cmd)
-
-	if err := cmd.Run(); err != nil {
+	if err := d.sendNativeMail(witnessAddr, subject, body); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of GUPP violation: %v", err)
 	} else {
 		d.logger.Printf("Notified %s of GUPP violation for %s", witnessAddr, agentID)
@@ -1307,12 +1261,7 @@ hook_bead: %s
 Action needed: Either restart the agent or reassign the work.`,
 		agentID, hookBead)
 
-	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body)
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = os.Environ() // Inherit PATH to find gt executable
-	util.SetDetachedProcessGroup(cmd)
-
-	if err := cmd.Run(); err != nil {
+	if err := d.sendNativeMail(witnessAddr, subject, body); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of orphaned work: %v", err)
 	} else {
 		d.logger.Printf("Notified %s of orphaned work for %s", witnessAddr, agentID)

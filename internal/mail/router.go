@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	beadsdk "github.com/steveyegge/beads"
 	"github.com/steveyegge/gastown/internal/beads"
 	"github.com/steveyegge/gastown/internal/config"
 	"github.com/steveyegge/gastown/internal/constants"
@@ -39,8 +40,9 @@ const DefaultIdleNotifyTimeout = 3 * time.Second
 // - Town-level (mayor/, deacon/) -> {townRoot}/.beads
 // - Rig-level (rig/polecat) -> {townRoot}/{rig}/.beads
 type Router struct {
-	workDir  string // fallback directory to run bd commands in
-	townRoot string // town root directory (e.g., ~/gt)
+	store    beadsdk.Storage // Optional retained store for the town mailbox.
+	workDir  string          // fallback directory to run bd commands in
+	townRoot string          // town root directory (e.g., ~/gt)
 	tmux     *tmux.Tmux
 
 	// IdleNotifyTimeout controls how long to wait for a session to become
@@ -49,6 +51,9 @@ type Router struct {
 
 	notifyWg sync.WaitGroup // tracks in-flight async notifications
 }
+
+// SetStore binds writes to a caller-owned town store before the router is used.
+func (r *Router) SetStore(store beadsdk.Storage) { r.store = store }
 
 // NewRouter creates a new mail router.
 // workDir should be a directory containing a .beads database.
@@ -698,7 +703,41 @@ func (r *Router) resolveAgentsByRig(rig string) ([]string, error) {
 
 // queryAgents queries agent beads using bd list with description filtering.
 // Searches both town-level and rig-level beads to find all agents.
+func (r *Router) nativeAgents(descContains string) ([]*agentBead, error) {
+	ctx, cancel := bdReadCtx()
+	defer cancel()
+	issues, err := r.store.SearchIssues(ctx, "", beadsdk.IssueFilter{Labels: []string{"gt:agent"}})
+	if err != nil {
+		return nil, err
+	}
+	wisps, err := r.store.ListWisps(ctx, beadsdk.WispFilter{})
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool)
+	var agents []*agentBead
+	for _, issue := range append(wisps, issues...) {
+		data, err := json.Marshal(issue)
+		if err != nil {
+			return nil, err
+		}
+		var agent agentBead
+		if err := json.Unmarshal(data, &agent); err != nil {
+			return nil, err
+		}
+		if !seen[agent.ID] && isAgentBeadEntry(&agent) && strings.Contains(agent.Description, descContains) {
+			seen[agent.ID] = true
+			agents = append(agents, &agent)
+		}
+	}
+	return agents, nil
+}
+
 func (r *Router) queryAgents(descContains string) []*agentBead {
+	if r.store != nil {
+		agents, _ := r.nativeAgents(descContains)
+		return agents
+	}
 	var allAgents []*agentBead
 
 	// Query town-level beads
@@ -964,6 +1003,9 @@ func (r *Router) validateRecipient(identity string) error {
 		}
 	}
 
+	if r.store != nil {
+		return fmt.Errorf("no agent found in town store")
+	}
 	// Query agents from rig-level beads via routes.jsonl
 	var routeQueryErr error
 	if r.townRoot != "" {
@@ -1171,12 +1213,23 @@ func (r *Router) sendToSingle(msg *Message) error {
 	args = append(args, "--", msg.Subject)
 
 	beadsDir := r.resolveBeadsDir()
-	if err := r.ensureCustomTypes(beadsDir); err != nil {
-		return err
-	}
 	ctx, cancel := bdWriteCtx()
 	defer cancel()
-	_, err := runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	var err error
+	if r.store != nil {
+		issue := &beadsdk.Issue{Title: msg.Subject, Description: msg.Body,
+			Status: beadsdk.StatusOpen, IssueType: beadsdk.TypeTask,
+			Priority: beadsPriority, Assignee: toIdentity, Labels: labels, Ephemeral: r.shouldBeWisp(msg)}
+		err = r.store.CreateIssue(ctx, issue, msg.From)
+		if err == nil {
+			msg.ID = issue.ID
+		}
+	} else {
+		if err := r.ensureCustomTypes(beadsDir); err != nil {
+			return err
+		}
+		_, err = runBdCommand(ctx, args, filepath.Dir(beadsDir), beadsDir)
+	}
 	telemetry.RecordMailMessage(context.Background(), "send", telemetry.MailMessageInfo{
 		ID:       msg.ID,
 		From:     msg.From,
@@ -1586,6 +1639,9 @@ func isSelfMail(from, to string) bool {
 func (r *Router) GetMailbox(address string) (*Mailbox, error) {
 	beadsDir := r.resolveBeadsDir()
 	workDir := filepath.Dir(beadsDir) // Parent of .beads
+	if r.store != nil {
+		return NewMailboxWithBeadsDirAndStore(AddressToIdentity(address), workDir, beadsDir, r.store), nil
+	}
 	return NewMailboxFromAddress(address, workDir), nil
 }
 

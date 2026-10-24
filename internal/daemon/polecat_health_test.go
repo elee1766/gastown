@@ -1,6 +1,8 @@
 package daemon
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	beadsdk "github.com/steveyegge/beads"
 
 	"github.com/steveyegge/gastown/internal/polecat"
 	"github.com/steveyegge/gastown/internal/session"
@@ -30,48 +34,64 @@ func writeFakeTestTmux(t *testing.T, dir string) {
 	}
 }
 
-// writeFakeTestBD creates a shell script in dir named "bd" that outputs a
-// polecat agent bead JSON. The descState parameter controls what appears in
-// the description text (parsed by ParseAgentFields), while
-// dbState controls the agent_state database column. updatedAt controls the
-// bead's updated_at timestamp for time-bound testing.
-func writeFakeTestBD(t *testing.T, dir, descState, dbState, hookBead, updatedAt string) string {
-	t.Helper()
-	desc := "agent_state: " + descState
-	// JSON matches the structure that getAgentBeadInfo expects from bd show --json
-	bdJSON := fmt.Sprintf(`[{"id":"gt-myr-polecat-mycat","issue_type":"agent","labels":["gt:agent"],"description":"%s","hook_bead":"%s","agent_state":"%s","updated_at":"%s"}]`,
-		desc, hookBead, dbState, updatedAt)
-	// Return agent bead JSON for "show", empty array for "list" (so
-	// hasAssignedOpenWork doesn't false-positive on the agent bead).
-	script := "#!/bin/sh\nif [ \"$1\" = \"list\" ]; then echo '[]'; exit 0; fi\necho '" + bdJSON + "'\n"
-	path := filepath.Join(dir, "bd")
-	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
-		t.Fatalf("writing fake bd: %v", err)
-	}
-	return path
+// newHealthStore creates a real disposable agent record and an open hook.
+// legacyState is retained only for older call sites; current state is description-backed.
+func newHealthStore(t *testing.T, dir, descState, dbState, hookBead, updatedAt string) map[string]beadsdk.Storage {
+	return nativeHealthStore(t, dir, descState, hookBead, "open", updatedAt)
 }
 
-// writeFakeBDWithHookBead creates a shell script in dir named "bd" that returns
-// different JSON based on the bead ID: the agent bead in one state, and the hook
-// bead (work bead) in a separate state. Used to test cases where the agent and hook
-// beads have independent lifecycles (e.g., agent done/nuked while hook_bead open).
-func writeFakeBDWithHookBead(t *testing.T, dir, agentState, hookBeadID, hookBeadStatus, updatedAt string) string {
+// newHealthStoreWithHook gives agent and work records independent lifecycles.
+func newHealthStoreWithHook(t *testing.T, dir, agentState, hookBeadID, hookBeadStatus, updatedAt string) map[string]beadsdk.Storage {
+	return nativeHealthStore(t, dir, agentState, hookBeadID, hookBeadStatus, updatedAt)
+}
+
+func nativeHealthStore(t *testing.T, dir, state, hook, status, updated string) map[string]beadsdk.Storage {
 	t.Helper()
-	agentJSON := fmt.Sprintf(`[{"id":"gt-myr-polecat-mycat","issue_type":"agent","labels":["gt:agent"],"description":"agent_state: %s","hook_bead":"%s","agent_state":"%s","updated_at":"%s"}]`,
-		agentState, hookBeadID, agentState, updatedAt)
-	hookJSON := fmt.Sprintf(`[{"id":"%s","status":"%s"}]`, hookBeadID, hookBeadStatus)
-	script := fmt.Sprintf("#!/bin/sh\n"+
-		"if [ \"$1\" = \"list\" ]; then echo '[]'; exit 0; fi\n"+
-		"case \"$2\" in\n"+
-		"  gt-myr-polecat-mycat) echo '%s';;\n"+
-		"  %s) echo '%s';;\n"+
-		"  *) echo '[]'; exit 1;;\n"+
-		"esac\n", agentJSON, hookBeadID, hookJSON)
-	bdPath := filepath.Join(dir, "bd")
-	if err := os.WriteFile(bdPath, []byte(script), 0755); err != nil {
-		t.Fatalf("writing fake bd: %v", err)
+	host := os.Getenv("GT_TEST_SDK_HOST")
+	if host == "" {
+		t.Skip("requires disposable GT_TEST_SDK_HOST")
 	}
-	return bdPath
+	t.Setenv("BEADS_DOLT_SERVER_HOST", host)
+	t.Setenv("BEADS_DOLT_SERVER_PORT", "3306")
+	t.Setenv("BEADS_DOLT_AUTO_START", "0")
+	data, _ := json.Marshal(map[string]any{"backend": "dolt", "dolt_mode": "server", "dolt_database": fmt.Sprintf("health_%d", time.Now().UnixNano()), "dolt_server_host": host, "dolt_server_port": 3306})
+	if err := os.WriteFile(filepath.Join(dir, "metadata.json"), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := beadsdk.OpenFromConfig(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	ctx := context.Background()
+	if err := store.SetConfig(ctx, "issue_prefix", "gt"); err != nil {
+		t.Fatal(err)
+	}
+	if state != "" {
+		issue := &beadsdk.Issue{ID: "gt-myr-polecat-mycat", Title: "agent", IssueType: beadsdk.TypeTask, Status: beadsdk.StatusOpen, Labels: []string{"gt:agent"}, Description: fmt.Sprintf("agent_state: %s\nhook_bead: %s", state, hook)}
+		if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+			t.Fatal(err)
+		}
+		timestamp, err := time.Parse(time.RFC3339, updated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.(interface{ DB() *sql.DB }).DB().ExecContext(ctx, "UPDATE issues SET updated_at = ? WHERE id = ?", timestamp, issue.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if hook != "" {
+		issue := &beadsdk.Issue{ID: hook, Title: "work", IssueType: beadsdk.TypeTask, Status: beadsdk.StatusOpen}
+		if err := store.CreateIssue(ctx, issue, "test"); err != nil {
+			t.Fatal(err)
+		}
+		if status == "closed" {
+			if err := store.CloseIssue(ctx, hook, "done", "test", ""); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	return map[string]beadsdk.Storage{"hq": store, "myr": store}
 }
 
 // TestCheckPolecatHealth_SkipsSpawning verifies that checkPolecatHealth does NOT
@@ -87,16 +107,17 @@ func TestCheckPolecatHealth_SkipsSpawning(t *testing.T) {
 	writeFakeTestTmux(t, binDir)
 	// Use a recent timestamp so the spawning guard's time-bound is satisfied
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "spawning", "spawning", "gt-xyz", recentTime)
+	stores := newHealthStore(t, binDir, "spawning", "spawning", "gt-xyz", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: t.TempDir()},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -121,16 +142,17 @@ func TestCheckPolecatHealth_DetectsCrashedPolecat(t *testing.T) {
 	binDir := t.TempDir()
 	writeFakeTestTmux(t, binDir)
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "working", "working", "gt-xyz", recentTime)
+	stores := newHealthStore(t, binDir, "working", "working", "gt-xyz", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: t.TempDir()},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -152,16 +174,17 @@ func TestCheckPolecatHealth_SpawningGuardExpires(t *testing.T) {
 	writeFakeTestTmux(t, binDir)
 	// Use a timestamp >5 minutes ago to expire the spawning guard
 	oldTime := time.Now().UTC().Add(-10 * time.Minute).Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "spawning", "spawning", "gt-xyz", oldTime)
+	stores := newHealthStore(t, binDir, "spawning", "spawning", "gt-xyz", oldTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: t.TempDir()},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -188,16 +211,17 @@ func TestCheckPolecatHealth_DescriptionStateOverridesLegacyDBColumn(t *testing.T
 	recentTime := time.Now().UTC().Format(time.RFC3339)
 	// Description says "spawning" (current Gastown contract) while the legacy
 	// structured column still says "working".
-	bdPath := writeFakeTestBD(t, binDir, "spawning", "working", "gt-xyz", recentTime)
+	stores := newHealthStore(t, binDir, "spawning", "working", "gt-xyz", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: t.TempDir()},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -223,16 +247,17 @@ func TestCheckPolecatHealth_SkipsClosedHookBead(t *testing.T) {
 	binDir := t.TempDir()
 	writeFakeTestTmux(t, binDir)
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeBDWithHookBead(t, binDir, "working", "fe-xyz", "closed", recentTime)
+	stores := newHealthStoreWithHook(t, binDir, "working", "fe-xyz", "closed", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: t.TempDir()},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -257,26 +282,22 @@ func TestCheckPolecatHealth_NotifiesWitnessOnCrash(t *testing.T) {
 	binDir := t.TempDir()
 	writeFakeTestTmux(t, binDir)
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "working", "working", "gt-xyz", recentTime)
+	stores := newHealthStore(t, binDir, "working", "working", "gt-xyz", recentTime)
 
-	// Create a fake gt script that logs invocations to a file
-	gtLog := filepath.Join(t.TempDir(), "gt-invocations.log")
-	fakeGt := filepath.Join(binDir, "gt")
-	gtScript := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %s\n", gtLog)
-	if err := os.WriteFile(fakeGt, []byte(gtScript), 0755); err != nil {
-		t.Fatalf("writing fake gt: %v", err)
-	}
+	// No CLI is available: notification must be written through the retained store.
+	fakeGt := filepath.Join(binDir, "missing-gt")
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	townRoot := t.TempDir()
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: townRoot},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
-		gtPath: fakeGt,
+		config:      &Config{TownRoot: townRoot},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
+		gtPath:      fakeGt,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -286,20 +307,10 @@ func TestCheckPolecatHealth_NotifiesWitnessOnCrash(t *testing.T) {
 		t.Fatalf("expected CRASH DETECTED, got: %q", got)
 	}
 
-	// Verify gt mail send was called with CRASHED_POLECAT subject
-	logData, err := os.ReadFile(gtLog)
-	if err != nil {
-		t.Fatalf("reading gt invocation log: %v", err)
-	}
-	invocations := string(logData)
-	if !strings.Contains(invocations, "mail send") {
-		t.Errorf("expected gt mail send invocation, got: %q", invocations)
-	}
-	if !strings.Contains(invocations, "CRASHED_POLECAT") {
-		t.Errorf("expected CRASHED_POLECAT in mail subject, got: %q", invocations)
-	}
-	if !strings.Contains(invocations, "myr/witness") {
-		t.Errorf("expected witness address myr/witness, got: %q", invocations)
+	assignee := "myr/witness"
+	messages, err := stores["hq"].SearchIssues(context.Background(), "", beadsdk.IssueFilter{Assignee: &assignee, Labels: []string{"gt:message"}})
+	if err != nil || len(messages) != 1 || !strings.Contains(messages[0].Title, "CRASHED_POLECAT") {
+		t.Fatalf("missing native crash notification: %+v %v", messages, err)
 	}
 }
 
@@ -316,16 +327,17 @@ func TestCheckPolecatHealth_SkipsDonePolecat(t *testing.T) {
 	binDir := t.TempDir()
 	writeFakeTestTmux(t, binDir)
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeBDWithHookBead(t, binDir, "done", "gt-xyz", "open", recentTime)
+	stores := newHealthStoreWithHook(t, binDir, "done", "gt-xyz", "open", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: t.TempDir()},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -355,16 +367,17 @@ func TestCheckPolecatHealth_SkipsNukedPolecat(t *testing.T) {
 	binDir := t.TempDir()
 	writeFakeTestTmux(t, binDir)
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeBDWithHookBead(t, binDir, "nuked", "gt-xyz", "open", recentTime)
+	stores := newHealthStoreWithHook(t, binDir, "nuked", "gt-xyz", "open", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: t.TempDir()},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: t.TempDir()},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	d.checkPolecatHealth("myr", "mycat")
@@ -408,24 +421,17 @@ func writeFakeTmuxIdleSession(t *testing.T, dir string) {
 	writeFakeTmuxWithAgent(t, dir, "bash")
 }
 
-// writeFakeBDLookupFail creates a "bd" script that fails on "show" (simulating a
-// bead infrastructure error) but returns configurable output for "list" queries.
-// When hasWork is true, "list" returns an open work bead assigned to "myr/polecats/mycat".
-func writeFakeBDLookupFail(t *testing.T, dir string, hasWork bool) string {
+// newMissingAgentStore omits the agent and optionally creates assigned work.
+func newMissingAgentStore(t *testing.T, dir string, hasWork bool) map[string]beadsdk.Storage {
 	t.Helper()
-	listOut := `[]`
+	stores := nativeHealthStore(t, dir, "", "", "", "")
 	if hasWork {
-		listOut = `[{"id":"wh-test-1","status":"open","assignee":"myr/polecats/mycat"}]`
+		issue := &beadsdk.Issue{Title: "assigned work", IssueType: beadsdk.TypeTask, Status: beadsdk.StatusOpen, Assignee: "myr/polecats/mycat"}
+		if err := stores["myr"].CreateIssue(context.Background(), issue, "test"); err != nil {
+			t.Fatal(err)
+		}
 	}
-	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"list\" ]; then echo '" + listOut + "'; exit 0; fi\n" +
-		"# show fails — simulate bead infrastructure degradation\n" +
-		"exit 1\n"
-	path := filepath.Join(dir, "bd")
-	if err := os.WriteFile(path, []byte(script), 0755); err != nil {
-		t.Fatalf("writing fake bd: %v", err)
-	}
-	return path
+	return stores
 }
 
 // TestReapIdlePolecat_SkipsWhenBeadLookupFailsButHasWork verifies that reapIdlePolecat
@@ -444,17 +450,18 @@ func TestReapIdlePolecat_SkipsWhenBeadLookupFailsButHasWork(t *testing.T) {
 
 	binDir := t.TempDir()
 	writeFakeTmuxIdleSession(t, binDir)
-	bdPath := writeFakeBDLookupFail(t, binDir, true /* hasWork */)
+	stores := newMissingAgentStore(t, binDir, true /* hasWork */)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	townRoot := t.TempDir()
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: townRoot},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmuxWithSocket(""),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: townRoot},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmuxWithSocket(""),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	hbPath := filepath.Join(townRoot, ".runtime", "heartbeats", "myr-mycat.json")
@@ -488,17 +495,18 @@ func TestReapIdlePolecat_ReapsWhenBeadLookupFailsAndNoWork(t *testing.T) {
 
 	binDir := t.TempDir()
 	writeFakeTmuxIdleSession(t, binDir)
-	bdPath := writeFakeBDLookupFail(t, binDir, false /* no work */)
+	stores := newMissingAgentStore(t, binDir, false /* no work */)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	townRoot := t.TempDir()
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: townRoot},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmuxWithSocket(""),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: townRoot},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmuxWithSocket(""),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	hbPath := filepath.Join(townRoot, ".runtime", "heartbeats", "myr-mycat.json")
@@ -541,17 +549,18 @@ func TestReapIdlePolecat_SkipsActiveAgent(t *testing.T) {
 	writeFakeTmuxWithAgent(t, binDir, "codex")
 	// Fake bd: agent bead exists but hook_bead is empty (cleared by failed sling)
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "working", "working", "", recentTime)
+	stores := newHealthStore(t, binDir, "working", "working", "", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	townRoot := t.TempDir()
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: townRoot},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmux(),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: townRoot},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmux(),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	// Write a stale heartbeat (working state, 20 minutes old) so the reaper considers it
@@ -592,17 +601,18 @@ func TestReapIdlePolecat_ReapsIdleNoHook(t *testing.T) {
 	writeFakeTmuxIdleSession(t, binDir)
 	// Fake bd: agent bead exists but hook_bead is empty
 	recentTime := time.Now().UTC().Format(time.RFC3339)
-	bdPath := writeFakeTestBD(t, binDir, "working", "working", "", recentTime)
+	stores := newHealthStore(t, binDir, "working", "working", "", recentTime)
 
 	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
 
 	townRoot := t.TempDir()
 	var logBuf strings.Builder
 	d := &Daemon{
-		config: &Config{TownRoot: townRoot},
-		logger: log.New(&logBuf, "", 0),
-		tmux:   tmux.NewTmuxWithSocket(""),
-		bdPath: bdPath,
+		config:      &Config{TownRoot: townRoot},
+		logger:      log.New(&logBuf, "", 0),
+		tmux:        tmux.NewTmuxWithSocket(""),
+		ctx:         context.Background(),
+		beadsStores: stores,
 	}
 
 	// Write a stale heartbeat (working state, 20 minutes old) so the reaper considers it

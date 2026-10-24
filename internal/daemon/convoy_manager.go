@@ -41,6 +41,8 @@ type strandedConvoyInfo struct {
 	ReadyIssues  []string  `json:"ready_issues"`
 	CreatedAt    time.Time `json:"created_at"`
 	BaseBranch   string    `json:"base_branch,omitempty"`
+	Complete     bool      `json:"complete"`
+	Native       bool      `json:"-"`
 }
 
 // ConvoyManager monitors beads events for issue closes and periodically scans for stranded convoys.
@@ -76,7 +78,8 @@ type ConvoyManager struct {
 	// Parked rigs are skipped during event polling. May be nil (never parked).
 	isRigParked func(string) bool
 
-	gtPath string
+	dispatchRetries map[string]dispatchRetry
+	gtPath          string
 
 	// started guards against double-call of Start() which would spawn duplicate goroutines.
 	started atomic.Bool
@@ -98,7 +101,8 @@ type ConvoyManager struct {
 	// seeded is true once the first poll cycle has run (warm-up).
 	// The first cycle advances high-water marks without processing events,
 	// preventing a burst of historical event replay on daemon restart.
-	seeded atomic.Bool
+	needsScan atomic.Bool
+	seeded    atomic.Bool
 
 	// processedCloses tracks issue IDs whose current closed state has already
 	// been processed. This prevents duplicate convoy checks when the same close
@@ -112,6 +116,22 @@ type ConvoyManager struct {
 	// been handled. This allows the 1s overlap window above without replaying
 	// the same lifecycle events on every poll.
 	processedLifecycleEvents sync.Map // map[string]bool
+}
+
+type dispatchRetry struct {
+	next  time.Time
+	delay time.Duration
+}
+
+// storeSnapshot borrows stores for daemon operations; shutdown owns closure.
+func (m *ConvoyManager) storeSnapshot() map[string]beadsdk.Storage {
+	m.storesMu.Lock()
+	defer m.storesMu.Unlock()
+	snapshot := make(map[string]beadsdk.Storage, len(m.stores))
+	for name, store := range m.stores {
+		snapshot[name] = store
+	}
+	return snapshot
 }
 
 // NewConvoyManager creates a new convoy manager.
@@ -150,12 +170,15 @@ func (m *ConvoyManager) Start() error {
 		m.logger("Convoy: Start() already called, ignoring duplicate")
 		return nil
 	}
-	m.wg.Add(2)
+	m.wg.Add(3)
 	go m.runEventPoll()
 	go m.runStrandedScan()
 	// Run a one-shot sweep to catch convoys that completed during any previous
 	// outage or while the daemon was stopped.
-	go m.runStartupSweep()
+	go func() {
+		defer m.wg.Done()
+		m.runStartupSweep()
+	}()
 	return nil
 }
 
@@ -264,6 +287,9 @@ func (m *ConvoyManager) pollStoresSnapshot(stores map[string]beadsdk.Storage) bo
 		}
 	}
 	m.seeded.CompareAndSwap(false, true)
+	if m.needsScan.Swap(false) {
+		m.scan()
+	}
 	return hadError
 }
 
@@ -381,8 +407,7 @@ func (m *ConvoyManager) pollStore(name string, store beadsdk.Storage, stores map
 		}
 
 		m.logger("Convoy: close detected: %s (from %s)", issueID, name)
-		resolver := convoy.NewStoreResolver(m.townRoot, stores)
-		convoy.CheckConvoysForIssue(m.ctx, hqStore, m.townRoot, issueID, "Convoy", m.logger, m.gtPath, m.isRigParked, resolver)
+		m.needsScan.Store(true)
 		convoy.FireCrossRigDepNotifications(m.ctx, issueID, m.townRoot, stores, m.logger)
 	}
 	return nil
@@ -487,6 +512,10 @@ func (m *ConvoyManager) scan() {
 
 		if c.ReadyCount > 0 {
 			m.feedFirstReady(c)
+		} else if c.Native {
+			if c.Complete {
+				m.checkConvoyCompletion(c.ID)
+			}
 		} else if c.TrackedCount == 0 {
 			// Empty convoy — but skip if it was just created (GH#2303).
 			// The sling's bd dep add may not be visible in Dolt yet.
@@ -508,6 +537,21 @@ func (m *ConvoyManager) scan() {
 
 // findStranded runs `gt convoy stranded --json` and parses the output.
 func (m *ConvoyManager) findStranded() ([]strandedConvoyInfo, error) {
+	stores := m.storeSnapshot()
+	if len(stores) > 0 {
+		snapshots, err := convoy.Scan(m.ctx, m.townRoot, stores, m.isRigParked)
+		if err != nil {
+			return nil, err
+		}
+		result := make([]strandedConvoyInfo, 0, len(snapshots))
+		for _, s := range snapshots {
+			result = append(result, strandedConvoyInfo{ID: s.ID, Title: s.Title, TrackedCount: s.TrackedCount, ReadyCount: s.ReadyCount, ReadyIssues: s.ReadyIssues, CreatedAt: s.CreatedAt, BaseBranch: s.BaseBranch, Complete: s.Complete, Native: true})
+		}
+		return result, nil
+	}
+	if m.openStores != nil {
+		return nil, fmt.Errorf("convoy stores not ready")
+	}
 	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "stranded", "--json")
 	cmd.Dir = m.townRoot
 	cmd.Env = bdReadOnlyRoutingEnv(m.townRoot)
@@ -558,6 +602,9 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 			continue
 		}
 
+		if retry := m.dispatchRetries[issueID]; time.Now().Before(retry.next) {
+			continue
+		}
 		m.logger("Convoy %s: feeding %s to %s", c.ID, issueID, rig)
 
 		slingArgs := []string{"sling", issueID, rig, "--no-boot"}
@@ -572,9 +619,23 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 		cmd.Stderr = &stderr
 
 		if err := cmd.Run(); err != nil {
-			m.logger("Convoy %s: sling %s failed: %s", c.ID, issueID, util.FirstLine(stderr.String()))
+			if m.dispatchRetries == nil {
+				m.dispatchRetries = make(map[string]dispatchRetry)
+			}
+			retry := m.dispatchRetries[issueID]
+			retry.delay *= 2
+			if retry.delay < time.Minute {
+				retry.delay = time.Minute
+			}
+			if retry.delay > 5*time.Minute {
+				retry.delay = 5 * time.Minute
+			}
+			retry.next = time.Now().Add(retry.delay)
+			m.dispatchRetries[issueID] = retry
+			m.logger("Convoy %s: sling %s failed (retry in %s): %s", c.ID, issueID, retry.delay, util.FirstLine(stderr.String()))
 			continue
 		}
+		delete(m.dispatchRetries, issueID)
 		return // Successfully dispatched one issue
 	}
 
@@ -585,6 +646,12 @@ func (m *ConvoyManager) feedFirstReady(c strandedConvoyInfo) {
 // tracked issues may all be closed. This handles the case where the event poll
 // missed the close events (e.g., daemon restart, Dolt latency).
 func (m *ConvoyManager) checkConvoyCompletion(convoyID string) {
+	if stores := m.storeSnapshot(); stores["hq"] != nil {
+		if err := convoy.Complete(m.ctx, m.townRoot, stores, convoyID); err != nil {
+			m.logger("Convoy %s: completion failed: %v", convoyID, err)
+		}
+		return
+	}
 	cmd := exec.CommandContext(m.ctx, m.gtPath, "convoy", "check", convoyID)
 	cmd.Dir = m.townRoot
 	cmd.Env = bdMutationRoutingEnv(m.townRoot)
@@ -616,8 +683,8 @@ func (m *ConvoyManager) closeEmptyConvoy(convoyID string) {
 // runStartupSweep runs one convoy check pass after a brief delay to catch
 // convoys that completed while the daemon was stopped or Dolt was unavailable.
 // It waits 10 seconds so Dolt has time to stabilize before the first query.
-// This goroutine is not tracked in wg because it is short-lived (exits after
-// a single scan) and does not need to participate in the Stop() shutdown.
+// The startup goroutine participates in Stop so retained stores stay open
+// until its scan finishes.
 func (m *ConvoyManager) runStartupSweep() {
 	timer := time.NewTimer(10 * time.Second)
 	defer timer.Stop()

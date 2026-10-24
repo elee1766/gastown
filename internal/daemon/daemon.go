@@ -2840,24 +2840,16 @@ func (d *Daemon) emitMassDeathEvent() {
 // On any error (bead not found, bd failure), returns false to err on the side
 // of crash detection rather than silently suppressing alerts.
 func (d *Daemon) isBeadClosed(beadID string) bool {
-	cmd := exec.Command(d.bdPath, "show", beadID, "--json") //nolint:gosec // G204: args are constructed internally
-	setSysProcAttr(cmd)
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = bdReadOnlyRoutingEnv(d.config.TownRoot)
-
-	output, err := cmd.Output()
+	rig := beads.GetRigNameForPrefix(d.config.TownRoot, beads.ExtractPrefix(beadID))
+	if rig == "" {
+		rig = "hq"
+	}
+	store, err := d.nativeStore(rig)
 	if err != nil {
 		return false
 	}
-
-	var issues []struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(output, &issues); err != nil || len(issues) == 0 {
-		return false
-	}
-
-	return issues[0].Status == "closed"
+	issue, err := store.GetIssue(d.ctx, beadID)
+	return err == nil && issue != nil && issue.Status == beadsdk.StatusClosed
 }
 
 // hasAssignedOpenWork checks if any work bead is assigned to the given polecat
@@ -2867,23 +2859,17 @@ func (d *Daemon) isBeadClosed(beadID string) bool {
 // field (updateAgentHookBead is a no-op). Without this fallback, the idle reaper
 // kills working polecats whose agent bead hook_bead is stale.
 func (d *Daemon) hasAssignedOpenWork(rigName, assignee string) bool {
-	rigDir := beads.GetRigDirForName(d.config.TownRoot, rigName)
-
-	for _, status := range []string{"hooked", "in_progress", "open"} {
-		args := beads.InjectFlatForListJSON([]string{"list", "--assignee=" + assignee, "--status=" + status, "--json"})
-		cmd := exec.Command(d.bdPath, args...) //nolint:gosec // G204: args are constructed internally
-		cmd.Dir = d.config.TownRoot
-		if rigDir != "" {
-			cmd.Env = bdReadOnlyPinnedEnv(beads.ResolveBeadsDir(rigDir))
-		} else {
-			cmd.Env = bdReadOnlyRoutingEnv(d.config.TownRoot)
-		}
-		output, err := cmd.Output()
-		if err != nil {
-			continue
-		}
-		var issues []json.RawMessage
-		if json.Unmarshal(output, &issues) == nil && len(issues) > 0 {
+	store, err := d.nativeStore(rigName)
+	if err != nil {
+		return true
+	} // Unknown ownership must not authorize reaping.
+	issues, err := store.SearchIssues(d.ctx, "", beadsdk.IssueFilter{Assignee: &assignee})
+	if err != nil {
+		return true
+	}
+	for _, issue := range issues {
+		switch string(issue.Status) {
+		case "hooked", "in_progress", "open":
 			return true
 		}
 	}
@@ -2902,11 +2888,7 @@ hook_bead: %s
 Restart deferred to stuck-agent-dog plugin for context-aware recovery.`,
 		polecatName, hookBead)
 
-	cmd := exec.Command(d.gtPath, "mail", "send", witnessAddr, "-s", subject, "-m", body) //nolint:gosec // G204: args are constructed internally
-	setSysProcAttr(cmd)
-	cmd.Dir = d.config.TownRoot
-	cmd.Env = append(os.Environ(), "BD_ACTOR=daemon") // Identify as daemon, not overseer
-	if err := cmd.Run(); err != nil {
+	if err := d.sendNativeMail(witnessAddr, subject, body); err != nil {
 		d.logger.Printf("Warning: failed to notify witness of crashed polecat: %v", err)
 	}
 }
@@ -3123,6 +3105,14 @@ func (d *Daemon) pruneStaleBranches() {
 // prevents double-dispatch on the next cycle. The batch_size config (default: 1)
 // limits how many beads are in-flight per heartbeat, reducing the timeout window.
 func (d *Daemon) dispatchQueuedWork() {
+	queued, err := d.hasNativeQueuedWork()
+	if err != nil {
+		d.logger.Printf("Scheduler queue unavailable: %v", err)
+		return
+	}
+	if !queued {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "gt", "scheduler", "run")
