@@ -205,6 +205,13 @@ func (m *Manager) Start(agentOverride string) error {
 	_ = t.AcceptStartupDialogs(sessionID)
 	m.startNudgePoller(sessionID)
 
+	// Promptless runtimes (prompt_mode "none", e.g. jcode) drop the startup
+	// prompt from the command line, so deliver it by nudge like the Witness.
+	if realTmux, ok := t.(*tmux.Tmux); ok {
+		_ = runtime.RunStartupFallback(realTmux, sessionID, "deacon", runtimeConfig)
+		_ = runtime.DeliverStartupPromptFallback(realTmux, sessionID, initialPrompt, runtimeConfig, constants.ClaudeStartTimeout)
+	}
+
 	time.Sleep(constants.ShutdownNotifyDelay)
 
 	return nil

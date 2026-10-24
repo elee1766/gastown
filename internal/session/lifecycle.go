@@ -179,8 +179,10 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 
 	// 3. Build startup command if not provided.
 	command := cfg.Command
+	startupPrompt := ""
 	if command == "" {
 		prompt := buildPrompt(cfg)
+		startupPrompt = prompt
 		var err error
 		command, err = buildCommand(cfg, prompt)
 		if err != nil {
@@ -292,6 +294,13 @@ func StartSession(t *tmux.Tmux, cfg SessionConfig) (_ *StartResult, retErr error
 	// and FindAgentPane. Legacy sessions without GT_PANE_ID fall back to scanning.
 	if paneID, err := t.GetPaneID(cfg.SessionID); err == nil {
 		_ = t.SetEnvironment(cfg.SessionID, "GT_PANE_ID", paneID)
+	}
+
+	// 13b. Promptless runtimes (prompt_mode "none", e.g. jcode) drop the
+	// startup prompt from the command line, so deliver it by nudge.
+	if startupPrompt != "" {
+		_ = runtime.RunStartupFallback(t, cfg.SessionID, cfg.Role, runtimeConfig)
+		_ = runtime.DeliverStartupPromptFallback(t, cfg.SessionID, startupPrompt, runtimeConfig, constants.ClaudeStartTimeout)
 	}
 
 	// 14. Track PID for defense-in-depth orphan cleanup.
